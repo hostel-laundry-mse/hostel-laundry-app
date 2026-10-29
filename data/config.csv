@@ -1,0 +1,12 @@
+section,key,value
+machines,A,3
+machines,B,2
+machines,C,2
+program,quick,30
+program,synthetics,60
+program,cotton,90
+program,bedding,120
+hours,open,07:00
+hours,close,23:00
+hours,days,Mon;Tue;Wed;Thu;Fri;Sat;Sun
+hours,slot_step_min,30

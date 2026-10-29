@@ -1,0 +1,16 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Data: ignore everything except config and the fake data files
+data/*
+!data/config.csv
+!data/fake_survey.csv
+!data/fake_schedule.csv
+!data/fake_schedule_bad.csv
+
+# Databases
+*.sqlite
