@@ -27,7 +27,7 @@ each file.
 |---|---|---|
 | Lead | App wiring | `app.R`, `CLAUDE.md`, `README.md`, `.gitignore`, `renv.lock` |
 | Person 1 | Optimiser (ompr model) | `R/optimiser.R` |
-| Person 2 | Constraint checker + data loading | `R/checker.R`, `R/data_load.R`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
+| Person 2 | Constraint checker + data loading | `R/checker.R`, `R/data_load.R`, `data/config.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
 | Person 3 | Shiny questionnaire + input pages | `R/mod_questionnaire.R`, `R/mod_admin.R` |
 | Person 4 | Results page (schedule table, charts) | `R/mod_results.R` (My slots and Schedule pages) |
 
@@ -37,7 +37,7 @@ What each file does:
 |---|---|
 | `app.R` | Joins modules into the navbar app; shared library calls |
 | `R/data_load.R` | `load_survey()`, `load_config()`, `db_connect()` |
-| `R/optimiser.R` | `optimise_schedule()`: survey + config to schedule |
+| `R/optimiser.R` | `run_optimiser()`: survey + config to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule |
 | `R/checker.R` | `check_schedule()`: validates a schedule, returns problems |
 | `R/mod_questionnaire.R` | Questionnaire page module |
 | `R/mod_admin.R` | Admin page module; runs optimiser and checker, returns the current schedule |
@@ -66,9 +66,14 @@ What each file does:
 | `room` | string | `B146` |
 | `program` | string, matches a `program` key in config | `cotton` |
 | `loads_per_week` | integer, 1 to 3 | `1` |
-| `availability` | `;`-separated `Day HH:MM-HH:MM` windows | `Mon 07:00-09:00;Fri 09:00-12:00` |
+| `availability` | `;`-separated `Day HH:MM-HH:MM` windows when the person is free | `Mon 07:00-09:00;Fri 09:00-12:00` |
+| `pref_days` | optional, `;`-separated days | `Sat;Sun` |
+| `pref_band` | optional, a `band` key from config | `evening` |
 
 Days are `Mon Tue Wed Thu Fri Sat Sun`. Times are 24-hour `HH:MM`.
+A booking is valid only if the whole wash (start to end) fits inside one of
+the person's `availability` windows. If `pref_days` / `pref_band` are missing
+or empty, the person has no preference.
 
 ## Config format
 
@@ -78,7 +83,14 @@ Days are `Mon Tue Wed Thu Fri Sat Sun`. Times are 24-hour `HH:MM`.
 - `program,<name>,<minutes>`: wash program durations
 - `hours,open|close,HH:MM`: laundry room opening hours
 - `hours,days,Mon;Tue;...`: days the laundry is open
-- `hours,slot_step_min,<minutes>`: granularity of start times
+- `hours,buffer_min,<minutes>`: machine time reserved after each wash (default 10)
+- `rules,grid_min,<minutes>`: time grid step; bookings start on it and occupy whole grid blocks (default 15)
+- `rules,reserve_share,<0-1>`: share of machine-minutes per hostel block per day kept free as emergency reserve (default 0)
+- `rules,peak_target,<minutes>`: booked machine-minutes per hostel block per clock hour above which the optimiser applies a penalty (default: no penalty)
+- `out_of_order,<machine id>,1`: machine that must not be used, e.g. `out_of_order,C-2,1` (default: none)
+- `band,<name>,HH:MM-HH:MM`: time bands for `pref_band`, e.g. `band,evening,17:00-23:00`
+
+All rows except `machines`, `program` and `hours,open|close|days` are optional.
 
 ## Schedule format
 

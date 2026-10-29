@@ -9,4 +9,10 @@ program,bedding,120
 hours,open,07:00
 hours,close,23:00
 hours,days,Mon;Tue;Wed;Thu;Fri;Sat;Sun
-hours,slot_step_min,30
+hours,buffer_min,10
+rules,grid_min,15
+rules,reserve_share,0.1
+rules,peak_target,120
+band,morning,07:00-12:00
+band,afternoon,12:00-17:00
+band,evening,17:00-23:00
