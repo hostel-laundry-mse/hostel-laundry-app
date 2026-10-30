@@ -1,5 +1,5 @@
 # Questionnaire module: a sample resident logs in, then enters their block,
-# room, course, wash program, blocked times and preferences.
+# course, wash program, blocked times and preferences.
 #
 # mod_questionnaire_ui(id)
 #   Takes: module id.
@@ -12,7 +12,7 @@
 #
 # Row saved (one per resident, a resubmission replaces the earlier row), the
 # survey format in CLAUDE.md:
-#   resident_id, name, block, room, program, course, blocked, pref_days,
+#   resident_id, name, block, program, course, blocked, pref_days,
 #   pref_band
 # `blocked` is `;`-separated `Day HH:MM-HH:MM`. An end before the start runs
 # past midnight (Mon 23:00-07:00) and counts towards the day it starts on; an
@@ -30,7 +30,7 @@ PATH_FAKE_SCHEDULE <- "data/fake_schedule.csv"
 BLOCK_GENDER <- c(A = "Female", B = "Female", C = "Female", D = "Male")
 GENDERS <- c("Female", "Male")
 
-SURVEY_COLUMNS <- c("resident_id", "name", "block", "room", "program",
+SURVEY_COLUMNS <- c("resident_id", "name", "block", "program",
                     "course", "blocked", "pref_days", "pref_band")
 
 # ---- Fallbacks, used only if a file above fails to load ----------------------
@@ -42,7 +42,7 @@ FALLBACK_BANDS <- c("morning", "afternoon", "evening")
 FALLBACK_MAX_BLOCKED_HOURS <- 10
 FALLBACK_RESIDENTS <- data.frame(
   resident_id = c("R001", "R002"), name = c("Kiran Okafor", "Noor Mehta"),
-  block = c("A", "A"), room = c("A101", "A204"),
+  block = c("A", "A"),
   program = c("quick", "normal"), course = c("DS", "AE"),
   blocked = c("Mon 23:00-07:00", ""), pref_days = c("Sat", ""),
   pref_band = c("morning", ""), stringsAsFactors = FALSE
@@ -222,15 +222,31 @@ test_blocked_helpers <- function() {
 }
 
 # One-row survey-format data.frame built from form values.
-build_response_row <- function(resident_id, name, block, room, program, course,
+build_response_row <- function(resident_id, name, block, program, course,
                                blocked, pref_days, pref_band = "",
                                days = FALLBACK_DAYS) {
   data.frame(resident_id = resident_id, name = name, block = block,
-             room = trimws(room), program = program, course = course,
+             program = program, course = course,
              blocked = format_windows(blocked, days),
              pref_days = paste(pref_days, collapse = ";"),
              pref_band = if (is.null(pref_band)) "" else pref_band,
              stringsAsFactors = FALSE)[, SURVEY_COLUMNS]
+}
+
+test_response_row <- function() {
+  row <- build_response_row("R001", "Kiran Okafor", "A", "quick", "DS",
+                            parse_windows("Mon 23:00-07:00"), c("Sat", "Sun"),
+                            "evening")
+  # exactly the columns of CLAUDE.md "Survey data format", in order, no room
+  stopifnot(identical(names(row), c("resident_id", "name", "block", "program",
+                                    "course", "blocked", "pref_days",
+                                    "pref_band")))
+  stopifnot(nrow(row) == 1, row$blocked == "Mon 23:00-07:00",
+            row$pref_days == "Sat;Sun")
+  # and the same as the header of the sample survey file
+  survey <- read_csv_chr(PATH_SURVEY)
+  if (is.data.frame(survey)) stopifnot(identical(names(row), names(survey)))
+  invisible(TRUE)
 }
 
 # Saves one row, replacing that resident's earlier row. With con = NULL (the
@@ -316,7 +332,6 @@ mod_questionnaire_ui <- function(id) {
             selectInput(ns("block"), "Block",
                         choices = blocks_for_gender(GENDERS[1], cfg$blocks),
                         selectize = FALSE, width = "8rem"),
-            textInput(ns("room"), "Room", width = "8rem"),
             selectInput(ns("course"), "Course", choices = q_courses(),
                         selectize = FALSE, width = "10rem"),
             selectInput(ns("program"), "Program", choices = prog_labels,
@@ -394,7 +409,6 @@ mod_questionnaire_server <- function(id, con = NULL) {
                           choices = blocks_for_gender(gender, cfg$blocks),
                           selected = block)
       }
-      updateTextInput(session, "room", value = get_col(r, "room"))
       if (get_col(r, "course") %in% q_courses()) {
         updateSelectInput(session, "course", selected = r$course)
       }
@@ -461,12 +475,8 @@ mod_questionnaire_server <- function(id, con = NULL) {
         showNotification(msg, type = "error")
         return()
       }
-      if (!nzchar(trimws(input$room))) {
-        showNotification("Please enter your room.", type = "error")
-        return()
-      }
       row <- build_response_row(current_user(), user_row()$name, input$block,
-                                input$room, input$program, input$course,
+                                input$program, input$course,
                                 blocked(), input$pref_days, input$pref_band,
                                 cfg$days)
       res <- tryCatch(save_response(con, row), error = function(e) e)
