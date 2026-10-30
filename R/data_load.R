@@ -3,7 +3,7 @@
 # load_survey(path)
 #   Takes: path to a survey CSV (see CLAUDE.md "Survey data format").
 #   Returns: data.frame with one row per resident, columns resident_id, name,
-#            block, room, program, course, blocked, pref_days, pref_band.
+#            block, program, course, blocked, pref_days, pref_band.
 #            Empty blocked, pref_days and pref_band are NA, and the pref
 #            columns are NA if the file does not have them.
 #
@@ -41,12 +41,12 @@
 WEEKDAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 load_survey <- function(path = "data/fake_survey.csv") {
-  survey <- read_data_csv(path, c("resident_id", "name", "block", "room",
-                                  "program", "course", "blocked"))
+  survey <- read_data_csv(path, c("resident_id", "name", "block", "program",
+                                  "course", "blocked"))
   for (col in c("pref_days", "pref_band")) {
     if (!col %in% names(survey)) survey[[col]] <- NA_character_
   }
-  survey <- survey[, c("resident_id", "name", "block", "room", "program",
+  survey <- survey[, c("resident_id", "name", "block", "program",
                        "course", "blocked", "pref_days", "pref_band")]
   require_values(survey, c("resident_id", "block", "program", "course"), path)
 
