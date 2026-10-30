@@ -1,14 +1,18 @@
 # Hostel Laundry Slot Scheduler
 
-Shiny app for a hostel: residents fill in a laundry questionnaire, an admin
-runs an optimiser that assigns each resident's loads to washing machines in
-their block, and residents see their slots.
+Shiny app for a hostel. Residents fill in a questionnaire (their course,
+times they can't wash, wash program). The app works out when each person is
+free from public course timetables, and an optimiser books every resident
+into a washing machine in their own block for each 10-day cycle. Residents
+see their slots, check in when they start, can change or release a slot, and
+can join a queue for extra slots that others release.
 
 ## Stack
 
 - **shiny** + **bslib**: UI, `page_navbar` with pages Questionnaire, My slots, Schedule, Admin
-- **ompr** + **ompr.roi** + **ROI.plugin.glpk**: the scheduling MILP, solved with GLPK
-- **DBI** + **RSQLite**: storing responses and schedules (`*.sqlite`, git-ignored)
+- **ompr** + **ompr.roi** + **ROI.plugin.glpk**: the scheduling model, solved with GLPK.
+  Solver choice is under review for speed (HiGHS is the alternative); do not change it without the lead.
+- **DBI** + **RSQLite**: storing responses, bookings, changes, check-ins and the queue (`*.sqlite`, git-ignored)
 - **DT**, **ggplot2**: schedule tables and charts
 - **readr**, **dplyr**: reading CSVs and data wrangling
 - **renv**: package versions locked in `renv.lock`. After clone, run `renv::restore()`.
@@ -25,24 +29,25 @@ each file.
 
 | Owner | Piece | Files |
 |---|---|---|
-| Lead | App wiring | `app.R`, `CLAUDE.md`, `README.md`, `.gitignore`, `renv.lock` |
-| Person 1 | Optimiser (ompr model) | `R/optimiser.R` |
-| Person 2 | Constraint checker + data loading | `R/checker.R`, `R/data_load.R`, `data/config.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
-| Person 3 | Shiny questionnaire + input pages | `R/mod_questionnaire.R`, `R/mod_admin.R` |
-| Person 4 | Results page (schedule table, charts) | `R/mod_results.R` (My slots and Schedule pages) |
+| Lead | App wiring, shared docs, packages | `app.R`, `CLAUDE.md`, `README.md`, `.gitignore`, `renv.lock` |
+| Person 1 | Optimiser and slot rules | `R/optimiser.R` |
+| Person 2 | Data, free time, database, checker | `R/data_load.R`, `R/checker.R`, `data/config.csv`, `data/timetable.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
+| Person 3 | Questionnaire and admin pages | `R/mod_questionnaire.R`, `R/mod_admin.R` |
+| Person 4 | Resident pages after the schedule is out | `R/mod_results.R` (My slots and Schedule pages) |
 
 What each file does:
 
 | File | Contents |
 |---|---|
 | `app.R` | Joins modules into the navbar app; shared library calls |
-| `R/data_load.R` | `load_survey()`, `load_config()`, `db_connect()` |
-| `R/optimiser.R` | `run_optimiser()`: survey + config to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule |
-| `R/checker.R` | `check_schedule()`: validates a schedule, returns problems |
-| `R/mod_questionnaire.R` | Questionnaire page module |
-| `R/mod_admin.R` | Admin page module; runs optimiser and checker, returns the current schedule |
-| `R/mod_results.R` | My slots and Schedule pages (`view = "mine"` / `"all"`) |
-| `data/config.csv` | Machines, programs, opening hours |
+| `R/data_load.R` | `load_survey()`, `load_config()`, `load_timetable()`, `build_free_windows()` (free time per person per date), `db_connect()` and database read/write helpers for the tables below |
+| `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule; `find_alternative_slots()`: options when someone changes a slot; `pick_from_queue()`: who gets a released slot |
+| `R/checker.R` | `check_schedule()`: validates a schedule against every rule below, returns problems |
+| `R/mod_questionnaire.R` | Questionnaire page: block, room, program, course, blocked times (with the 10-hour check), preferences |
+| `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows |
+| `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" flow, changes left, join the extra-slot queue. Schedule page: all machines by date, "Free now" list |
+| `data/config.csv` | Machines, programs, opening hours, rules |
+| `data/timetable.csv` | Weekly lecture timetable per course (public data) |
 | `data/fake_survey.csv` | Made-up residents (survey format) |
 | `data/fake_schedule.csv` | A valid schedule (schedule format) |
 | `data/fake_schedule_bad.csv` | A schedule that breaks the checker's rules |
@@ -53,6 +58,66 @@ What each file does:
 - Merge into `main` through a pull request.
 - `renv.lock` is shared: if you need a new package, ask the lead to add it so only one person changes the lockfile at a time.
 - Until the optimiser works, build and test against `data/fake_schedule.csv`.
+
+## Scheduling rules
+
+**Cycle.** Schedules cover 10 days from a cycle start date the admin picks.
+Everyone gets 2 bookings per cycle. Extra washes come only from the queue.
+
+**Gap between washes.** A person's consecutive bookings are 4 or 5 days
+apart (by date). This also applies across cycles: the first booking of a
+cycle is 4-5 days after the person's last booking of the previous cycle.
+To keep the next cycle possible, the second booking falls on day 6 or later
+of the cycle. A person with no booking in the previous cycle has no
+constraint on their first booking. The gap is measured from the dates the
+optimiser planned, even if the person changed the slot or did not show up;
+extra slots from the queue do not count.
+
+**Time blocks.** Each day is cut into 30-minute blocks from opening time. A
+booking starts on a block and holds the machine for
+ceiling((program duration + buffer) / 30) blocks. The person's slot is start
+to start + program duration; the buffer is machine time only.
+
+**Free time.** For each person and date:
+opening hours minus lectures of their course (including 30 minutes before
+and after each lecture) minus their personal blocked times. A booking is
+valid only if the whole wash (start to end) fits inside free time.
+
+**Blocked times.** Each person may block at most 10 hours per day in total,
+sleep included. A block that crosses midnight is written on the day it
+starts (e.g. `Mon 23:30-07:30` runs into Tuesday) and counts towards that day.
+
+**Other rules.**
+- Only machines in the person's own block (blocks are single-gender).
+- Out-of-order machines are never used.
+- A machine runs at most one booking at a time, buffer included.
+- Emergency reserve: on each date, each block keeps at least `reserve_share` of its machine time unbooked.
+- Busy hours above `peak_target` are avoided where possible.
+- Preferred days and time bands are honoured where possible; getting everyone a booking always comes first.
+- If someone's free time leaves no valid booking, they are listed as underserved with the reason.
+
+## Changes, check-in and the queue
+
+**Changing a slot.**
+- Allowed up to 6 hours before the slot starts.
+- At most 3 changes per person in any 30 days. A change applies to that one booking only.
+- A changed slot does not have to keep the 4-5 day gap, but it must still be on a different date from the person's other bookings and obey every other rule. The next cycle's gap is measured from the date the optimiser originally planned, so a change never makes the next cycle impossible.
+- Flow: the person taps "Can't make it", the app shows alternative slots that obey every rule above without moving anyone else, and the person picks one or releases the slot.
+- Less than 6 hours before: no change, but the person can still release the slot (counts as one of the 3).
+
+**Check-in.** The person taps "Started" between the slot start and 15
+minutes after. No check-in by then: the booking is marked a no-show and the
+slot is released.
+
+**Released slots and the queue.** People can join a queue asking for an extra
+slot. When a slot is released it goes to the first eligible person in the
+queue. Eligible means: same block, their program fits in the released machine
+time, it is inside their free time, and they have no other booking that day.
+Order: people with fewer than 2 bookings this cycle first, then earliest
+request. There are no notifications: the new booking appears in the person's
+My slots. If the slot starts too soon for that (under 1 hour away) or nobody
+in the queue fits, it goes on the Schedule page's "Free now" list, where any
+eligible resident can claim it, first come first served.
 
 ## Survey data format
 
@@ -65,15 +130,37 @@ What each file does:
 | `block` | string, matches a `machines` key in config | `B` |
 | `room` | string | `B146` |
 | `program` | string, matches a `program` key in config | `cotton` |
-| `loads_per_week` | integer, 1 to 3 | `1` |
-| `availability` | `;`-separated `Day HH:MM-HH:MM` windows when the person is free | `Mon 07:00-09:00;Fri 09:00-12:00` |
-| `pref_days` | optional, `;`-separated days | `Sat;Sun` |
+| `course` | string, matches a `course` in the timetable | `BTECH-CSE-Y2` |
+| `blocked` | `;`-separated weekly `Day HH:MM-HH:MM` times the person can't wash, sleep included, at most 10 h per day; an end before the start means it runs past midnight | `Mon 23:30-07:30;Sat 07:00-09:00` |
+| `pref_days` | optional, `;`-separated weekdays | `Sat;Sun` |
 | `pref_band` | optional, a `band` key from config | `evening` |
 
 Days are `Mon Tue Wed Thu Fri Sat Sun`. Times are 24-hour `HH:MM`.
-A booking is valid only if the whole wash (start to end) fits inside one of
-the person's `availability` windows. If `pref_days` / `pref_band` are missing
-or empty, the person has no preference.
+Everyone in a course is assumed to have that course's full timetable.
+If `pref_days` / `pref_band` are missing or empty, the person has no preference.
+
+## Timetable format
+
+`data/timetable.csv`, one row per weekly lecture:
+
+| Column | Type | Example |
+|---|---|---|
+| `course` | string | `BTECH-CSE-Y2` |
+| `day` | `Mon` ... `Sun` | `Tue` |
+| `start` | `HH:MM` | `09:00` |
+| `end` | `HH:MM` | `10:30` |
+
+## Free windows format
+
+`build_free_windows(survey, timetable, config, cycle_start)` returns, and the
+optimiser takes, one row per free stretch of time:
+
+| Column | Type | Example |
+|---|---|---|
+| `resident_id` | from the survey | `R001` |
+| `date` | `YYYY-MM-DD`, within the cycle | `2026-11-03` |
+| `from` | `HH:MM` | `14:00` |
+| `to` | `HH:MM` | `17:30` |
 
 ## Config format
 
@@ -84,9 +171,17 @@ or empty, the person has no preference.
 - `hours,open|close,HH:MM`: laundry room opening hours
 - `hours,days,Mon;Tue;...`: days the laundry is open
 - `hours,buffer_min,<minutes>`: machine time reserved after each wash (default 10)
-- `rules,grid_min,<minutes>`: time grid step; bookings start on it and occupy whole grid blocks (default 15)
-- `rules,reserve_share,<0-1>`: share of machine-minutes per hostel block per day kept free as emergency reserve (default 0)
-- `rules,peak_target,<minutes>`: booked machine-minutes per hostel block per clock hour above which the optimiser applies a penalty (default: no penalty)
+- `rules,grid_min,<minutes>`: time block length (default 30)
+- `rules,cycle_days,<days>`: cycle length (default 10)
+- `rules,gap_min_days,<days>` and `rules,gap_max_days,<days>`: days between a person's consecutive bookings (default 4 and 5)
+- `rules,lecture_margin_min,<minutes>`: unavailable time before and after each lecture (default 30)
+- `rules,max_blocked_hours,<hours>`: personal blocked time allowed per day, sleep included (default 10)
+- `rules,change_cutoff_hours,<hours>`: latest a slot can be changed before it starts (default 6)
+- `rules,max_changes,<n>` and `rules,changes_window_days,<days>`: change limit (default 3 per 30)
+- `rules,checkin_grace_min,<minutes>`: time after slot start to check in (default 15)
+- `rules,queue_min_lead_min,<minutes>`: released slots starting sooner than this go to "Free now" instead of the queue (default 60)
+- `rules,reserve_share,<0-1>`: share of machine time per block per date kept free as emergency reserve (default 0)
+- `rules,peak_target,<minutes>`: booked machine-minutes per block per clock hour above which the optimiser applies a penalty (default: no penalty)
 - `out_of_order,<machine id>,1`: machine that must not be used, e.g. `out_of_order,C-2,1` (default: none)
 - `band,<name>,HH:MM-HH:MM`: time bands for `pref_band`, e.g. `band,evening,17:00-23:00`
 
@@ -95,12 +190,25 @@ All rows except `machines`, `program` and `hours,open|close|days` are optional.
 ## Schedule format
 
 The optimiser returns, and the checker and results pages take, a data.frame
-with one row per assigned load:
+with one row per booking:
 
 | Column | Type | Example |
 |---|---|---|
 | `person` | `resident_id` from the survey | `R001` |
 | `machine` | `<block>-<number>` | `B-2` |
-| `day` | `Mon` ... `Sun` | `Fri` |
+| `date` | `YYYY-MM-DD` | `2026-11-03` |
 | `start` | `HH:MM` | `09:30` |
 | `end` | `HH:MM`, start + program duration | `11:00` |
+
+## Database tables
+
+SQLite, created and accessed through helpers in `R/data_load.R`:
+
+- `bookings`: `booking_id, person, machine, date, start, end, status, source`.
+  `status` is `booked`, `checked_in`, `released`, `no_show` or `moved`;
+  `source` is `optimiser`, `change`, `queue` or `free_now`.
+  A change marks the old row `moved` and adds a new row, so rows with
+  `source = optimiser` (any status) always hold the planned dates used for
+  the next cycle's gap.
+- `changes`: `person, booking_id, at, kind` (`change` or `release`), used for the 3-per-30-days limit.
+- `queue`: `person, requested_at, status` (`waiting`, `served`, `withdrawn`).
