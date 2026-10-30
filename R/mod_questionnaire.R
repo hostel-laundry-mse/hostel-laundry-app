@@ -1,5 +1,5 @@
 # Questionnaire module: a sample resident logs in, then enters their block,
-# course, wash program, blocked times and preferred days.
+# room, course, wash program, blocked times and preferences.
 #
 # mod_questionnaire_ui(id)
 #   Takes: module id.
@@ -10,34 +10,104 @@
 #   Returns: reactive giving the latest submitted response as a one-row
 #            data.frame in the survey format (see CLAUDE.md).
 #
-# Row saved (one per resident, a resubmission replaces the earlier row):
-#   resident_id, name, block, course, program, blocked, pref_days, pref_band
-# `blocked` uses the same `;`-separated `Day HH:MM-HH:MM` string as
-# `availability` in CLAUDE.md, but lists times the resident is NOT free.
-# TODO: CLAUDE.md does not define `blocked` or `course` yet; confirm the format.
+# Row saved (one per resident, a resubmission replaces the earlier row), the
+# survey format in CLAUDE.md:
+#   resident_id, name, block, room, program, course, blocked, pref_days,
+#   pref_band
+# `blocked` is `;`-separated `Day HH:MM-HH:MM`. An end before the start runs
+# past midnight (Mon 23:00-07:00) and counts towards the day it starts on; an
+# end of 24:00 means midnight.
 
-DAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-BLOCKED_LIMIT_HOURS <- 10
+# ---- File paths (the only place they are written) ----------------------------
+PATH_SURVEY <- "data/fake_survey.csv"
+PATH_TIMETABLE <- "data/fake_timetable.csv"  # CLAUDE.md: data/timetable.csv
+PATH_CONFIG <- "data/config.csv"
+PATH_LAST_PLANNED <- "data/fake_last_planned.csv"
+PATH_FAKE_SCHEDULE <- "data/fake_schedule.csv"
 
-# ---- Fallbacks, used while load_config() / load_survey() are stubs ----------
-# TODO: remove each fallback once the real loader returns the value.
+SURVEY_COLUMNS <- c("resident_id", "name", "block", "room", "program",
+                    "course", "blocked", "pref_days", "pref_band")
+
+# ---- Fallbacks, used only if a file above fails to load ----------------------
+FALLBACK_DAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 FALLBACK_BLOCKS <- c("A", "B", "C", "D")
 FALLBACK_COURSES <- c("DS", "FE", "GE", "AE", "AQF", "EE", "MBA")
 FALLBACK_PROGRAMS <- c(quick = 30, normal = 60)
-FALLBACK_BANDS <- c("morning", "afternoon", "evening")  # TODO: from config
+FALLBACK_BANDS <- c("morning", "afternoon", "evening")
+FALLBACK_MAX_BLOCKED_HOURS <- 10
 FALLBACK_RESIDENTS <- data.frame(
-  resident_id = c("R001", "R002", "R003"),
-  name = c("Aarav Okafor", "Meera Rao", "Tara Singh"),
-  block = c("A", "C", "D"),
-  course = c("DS", "MBA", "EE"),
-  program = c("quick", "normal", "quick"),
-  blocked = "",
-  pref_days = c("Sat;Sun", "", "Fri"),
-  pref_band = c("evening", "", "morning"),
-  stringsAsFactors = FALSE
+  resident_id = c("R001", "R002"), name = c("Kiran Okafor", "Noor Mehta"),
+  block = c("A", "A"), room = c("A101", "A204"),
+  program = c("quick", "normal"), course = c("DS", "AE"),
+  blocked = c("Mon 23:00-07:00", ""), pref_days = c("Sat", ""),
+  pref_band = c("morning", ""), stringsAsFactors = FALSE
 )
 
-# ---- Pure helpers (tested by test_blocked_helpers()) ------------------------
+# ---- Reading files -----------------------------------------------------------
+
+# Everything as character, empty cells stay "". NULL if the file fails to load.
+read_csv_chr <- function(path) {
+  tryCatch(
+    as.data.frame(readr::read_csv(path, col_types = readr::cols(.default = "c"),
+                                  na = character(), show_col_types = FALSE)),
+    error = function(e) NULL, warning = function(w) NULL)
+}
+
+# named character vector key -> value for one config section
+config_section <- function(tab, section) {
+  rows <- tab[tab$section == section, , drop = FALSE]
+  setNames(rows$value, rows$key)
+}
+
+# What the forms need from data/config.csv, with fallbacks if it fails to load.
+q_config <- function(path = PATH_CONFIG) {
+  tab <- read_csv_chr(path)
+  ok <- is.data.frame(tab) && all(c("section", "key", "value") %in% names(tab))
+  if (!ok) {
+    return(list(from_file = FALSE, blocks = FALLBACK_BLOCKS,
+                programs = FALLBACK_PROGRAMS, bands = FALLBACK_BANDS,
+                days = FALLBACK_DAYS,
+                max_blocked_hours = FALLBACK_MAX_BLOCKED_HOURS))
+  }
+  or <- function(x, default) if (length(x)) x else default
+  rules <- config_section(tab, "rules")
+  hours <- config_section(tab, "hours")
+  programs <- config_section(tab, "program")
+  list(
+    from_file = TRUE,
+    blocks = or(names(config_section(tab, "machines")), FALLBACK_BLOCKS),
+    programs = or(setNames(as.numeric(programs), names(programs)),
+                  FALLBACK_PROGRAMS),
+    bands = or(names(config_section(tab, "band")), FALLBACK_BANDS),
+    days = if ("days" %in% names(hours)) {
+      strsplit(hours[["days"]], ";", fixed = TRUE)[[1]]
+    } else FALLBACK_DAYS,
+    max_blocked_hours = if ("max_blocked_hours" %in% names(rules)) {
+      as.numeric(rules[["max_blocked_hours"]])
+    } else FALLBACK_MAX_BLOCKED_HOURS
+  )
+}
+
+# Unique courses in the timetable.
+q_courses <- function(path = PATH_TIMETABLE) {
+  t <- read_csv_chr(path)
+  if (is.data.frame(t) && "course" %in% names(t) && nrow(t) > 0) {
+    return(unique(t$course))
+  }
+  FALLBACK_COURSES
+}
+
+# Sample residents (survey format).
+q_residents <- function(path = PATH_SURVEY) {
+  s <- read_csv_chr(path)
+  if (is.data.frame(s) && nrow(s) > 0 && "resident_id" %in% names(s)) return(s)
+  FALLBACK_RESIDENTS
+}
+
+# ---- Pure helpers for blocked windows (tested by test_blocked_helpers()) -----
+# A window is a row of data.frame(day, start, end), minutes after midnight of
+# its start day. `end` runs past 1440 when the window crosses midnight, so the
+# length is always end - start.
 
 hhmm_to_min <- function(x) {
   p <- strsplit(x, ":", fixed = TRUE)
@@ -51,30 +121,34 @@ empty_windows <- function() {
              stringsAsFactors = FALSE)
 }
 
-# "Mon 00:00-07:00;Tue 23:00-24:00" -> data.frame(day, start, end) in minutes
+# "Mon 23:00-07:00;Wed 22:00-24:00" -> data.frame(day, start, end)
 parse_windows <- function(x) {
   if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) {
     return(empty_windows())
   }
   parts <- trimws(strsplit(x, ";", fixed = TRUE)[[1]])
-  parts <- parts[nzchar(parts)]
-  day <- sub(" .*$", "", parts)
+  parts <- parts[grepl("^[A-Za-z]{3} \\d{1,2}:\\d{2}-\\d{1,2}:\\d{2}$", parts)]
+  if (length(parts) == 0) return(empty_windows())
   times <- strsplit(sub("^\\S+ ", "", parts), "-", fixed = TRUE)
-  data.frame(day = day,
-             start = hhmm_to_min(vapply(times, `[`, "", 1)),
-             end = hhmm_to_min(vapply(times, `[`, "", 2)),
+  start <- hhmm_to_min(vapply(times, `[`, "", 1))
+  end <- hhmm_to_min(vapply(times, `[`, "", 2))
+  end <- ifelse(end <= start, end + 1440L, end)  # crosses midnight
+  data.frame(day = sub(" .*$", "", parts), start = start, end = end,
              stringsAsFactors = FALSE)
 }
 
-format_windows <- function(w) {
+# Back to the string the data uses: an end past midnight is written as the
+# clock time on the next day, an end exactly at midnight as 24:00.
+format_windows <- function(w, days = FALLBACK_DAYS) {
   if (nrow(w) == 0) return("")
-  w <- w[order(match(w$day, DAYS), w$start), ]
-  paste0(w$day, " ", min_to_hhmm(w$start), "-", min_to_hhmm(w$end),
+  w <- w[order(match(w$day, days), w$start), ]
+  end <- ifelse(w$end > 1440L, w$end - 1440L, w$end)
+  paste0(w$day, " ", min_to_hhmm(w$start), "-", min_to_hhmm(end),
          collapse = ";")
 }
 
-# Merge overlapping or touching windows within each day.
-merge_windows <- function(w) {
+# Merge overlapping or touching windows that start on the same day.
+merge_windows <- function(w, days = FALLBACK_DAYS) {
   if (nrow(w) == 0) return(empty_windows())
   out <- list()
   for (d in unique(w$day)) {
@@ -94,57 +168,69 @@ merge_windows <- function(w) {
     out[[length(out) + 1]] <- data.frame(day = d, start = cur_s, end = cur_e)
   }
   res <- do.call(rbind, out)
-  res <- res[order(match(res$day, DAYS), res$start), ]
+  res <- res[order(match(res$day, days), res$start), ]
   rownames(res) <- NULL
   res
 }
 
-# Named numeric vector: merged blocked hours for each day that has any.
+# Named numeric vector: merged blocked hours per start day, for days that
+# have any.
 hours_per_day <- function(w) {
   m <- merge_windows(w)
   if (nrow(m) == 0) return(setNames(numeric(), character()))
-  tapply((m$end - m$start) / 60, factor(m$day, levels = DAYS), sum)[
-    unique(m$day)]
+  tot <- tapply((m$end - m$start) / 60, m$day, sum)
+  tot[unique(m$day)]
 }
 
-days_over_limit <- function(w, limit = BLOCKED_LIMIT_HOURS) {
+days_over_limit <- function(w, limit = FALLBACK_MAX_BLOCKED_HOURS) {
   h <- hours_per_day(w)
   h[h > limit]
 }
 
 test_blocked_helpers <- function() {
-  w <- data.frame(day = c("Mon", "Mon", "Mon", "Tue"),
-                  start = hhmm_to_min(c("00:00", "06:00", "09:00", "08:00")),
-                  end = hhmm_to_min(c("07:00", "08:00", "10:00", "10:00")),
-                  stringsAsFactors = FALSE)
-  m <- merge_windows(w)
-  stopifnot(nrow(m) == 3)                              # overlap merged
-  stopifnot(identical(m$end[1], hhmm_to_min("08:00"))) # 00:00-08:00
-  stopifnot(hours_per_day(w)[["Mon"]] == 9, hours_per_day(w)[["Tue"]] == 2)
-  stopifnot(length(days_over_limit(w)) == 0)
-  big <- rbind(w, data.frame(day = "Mon", start = hhmm_to_min("20:00"),
-                             end = hhmm_to_min("24:00")))
-  stopifnot(identical(names(days_over_limit(big)), "Mon"))  # 13h > 10h
+  # parse and format as the data writes them
+  w <- parse_windows("Mon 23:00-07:00;Wed 22:00-24:00;Sun 00:00-10:00")
+  stopifnot(identical(w$end, c(1860L, 1440L, 600L)))        # 07:00 next day
+  stopifnot(format_windows(w) == "Mon 23:00-07:00;Wed 22:00-24:00;Sun 00:00-10:00")
   stopifnot(format_windows(parse_windows("Tue 08:00-10:00;Mon 00:00-07:30")) ==
               "Mon 00:00-07:30;Tue 08:00-10:00")
-  stopifnot(nrow(parse_windows("")) == 0)
+  stopifnot(nrow(parse_windows("")) == 0, nrow(parse_windows(NA)) == 0)
+  # hours, crossing midnight counts to the start day
+  h <- hours_per_day(w)
+  stopifnot(h[["Mon"]] == 8, h[["Wed"]] == 2, h[["Sun"]] == 10)
+  stopifnot(length(days_over_limit(w)) == 0)                 # exactly 10 is fine
+  # merging overlaps, including across midnight
+  m <- merge_windows(parse_windows("Mon 23:00-07:00;Mon 23:30-24:00"))
+  stopifnot(nrow(m) == 1, format_windows(m) == "Mon 23:00-07:00")  # contained
+  m <- merge_windows(parse_windows("Mon 23:00-07:00;Mon 06:00-09:00"))
+  stopifnot(nrow(m) == 2)  # 06:00-09:00 is Monday morning, a different time
+  m <- merge_windows(parse_windows("Mon 22:00-23:30;Mon 23:00-07:00"))
+  stopifnot(format_windows(m) == "Mon 22:00-07:00",
+            hours_per_day(m)[["Mon"]] == 9)
+  stopifnot(nrow(merge_windows(parse_windows("Mon 08:00-09:00;Mon 10:00-11:00"))) == 2)
+  # over the limit
+  over <- days_over_limit(parse_windows("Mon 22:00-09:00;Tue 08:00-10:00"))
+  stopifnot(identical(names(over), "Mon"), over[["Mon"]] == 11)
+  over <- days_over_limit(parse_windows("Fri 20:00-24:00;Fri 00:00-07:00"), 10)
+  stopifnot(over[["Fri"]] == 11)                             # separate windows add up
   invisible(TRUE)
 }
 
 # One-row survey-format data.frame built from form values.
-build_response_row <- function(resident_id, name, block, course, program,
-                               blocked, pref_days, pref_band = "") {
+build_response_row <- function(resident_id, name, block, room, program, course,
+                               blocked, pref_days, pref_band = "",
+                               days = FALLBACK_DAYS) {
   data.frame(resident_id = resident_id, name = name, block = block,
-             course = course, program = program,
-             blocked = format_windows(blocked),
+             room = trimws(room), program = program, course = course,
+             blocked = format_windows(blocked, days),
              pref_days = paste(pref_days, collapse = ";"),
              pref_band = if (is.null(pref_band)) "" else pref_band,
-             stringsAsFactors = FALSE)
+             stringsAsFactors = FALSE)[, SURVEY_COLUMNS]
 }
 
 # Saves one row, replacing that resident's earlier row. With con = NULL (the
 # database is not ready) nothing is written. Returns list(saved, row).
-# TODO: table name "responses" is a guess until Person 2 creates the tables.
+# TODO: table name "responses" is a guess until the database tables exist.
 save_response <- function(con, row) {
   if (is.null(con)) return(list(saved = FALSE, row = row))
   if (DBI::dbExistsTable(con, "responses")) {
@@ -155,59 +241,8 @@ save_response <- function(con, row) {
   list(saved = TRUE, row = row)
 }
 
-# ---- Option sources ----------------------------------------------------------
-
-q_residents <- function() {
-  s <- tryCatch(load_survey(), error = function(e) NULL)
-  if (!is.data.frame(s) || nrow(s) == 0) {
-    s <- tryCatch(readr::read_csv("data/fake_survey.csv", col_types = readr::cols(.default = "c"),
-                                  show_col_types = FALSE),
-                  error = function(e) NULL)
-  }
-  if (is.data.frame(s) && nrow(s) > 0) return(as.data.frame(s))
-  FALLBACK_RESIDENTS  # TODO: fake_survey.csv has no rows yet
-}
-
-q_blocks <- function() {
-  cfg <- tryCatch(load_config(), error = function(e) NULL)
-  b <- if (is.list(cfg)) cfg$machines$block else NULL
-  if (length(b)) b else FALLBACK_BLOCKS
-}
-
-q_courses <- function(path = "data/timetable.csv") {
-  if (file.exists(path)) {
-    t <- tryCatch(readr::read_csv(path, show_col_types = FALSE), error = function(e) NULL)
-    if (is.data.frame(t) && "course" %in% names(t) && nrow(t) > 0) {
-      return(sort(unique(t$course)))
-    }
-  }
-  FALLBACK_COURSES  # TODO: data/timetable.csv does not exist yet
-}
-
-# named vector program key -> minutes
-q_programs <- function() {
-  cfg <- tryCatch(load_config(), error = function(e) NULL)
-  p <- if (is.list(cfg)) cfg$programs else NULL
-  if (is.data.frame(p) && nrow(p) > 0) {
-    return(setNames(p$duration_min, p$program))
-  }
-  FALLBACK_PROGRAMS
-}
-
-# band keys from config; the form adds "no preference" itself
-q_bands <- function() {
-  cfg <- tryCatch(load_config(), error = function(e) NULL)
-  b <- if (is.list(cfg)) names(cfg$bands) else NULL
-  if (length(b)) b else FALLBACK_BANDS
-}
-
-q_opening <- function() {
-  cfg <- tryCatch(load_config(), error = function(e) NULL)
-  h <- if (is.list(cfg)) cfg$hours else NULL
-  # TODO: machines are usable 24 h; time pickers use the full day until the
-  # config loader works. Opening hours are read from config once it does.
-  list(open = if (!is.null(h$open)) h$open else "00:00",
-       close = if (!is.null(h$close)) h$close else "24:00")
+resident_choices <- function(residents) {
+  setNames(residents$resident_id, paste(residents$resident_id, residents$name))
 }
 
 time_choices <- function(from = "00:00", to = "24:00", step = 30) {
@@ -218,63 +253,74 @@ time_choices <- function(from = "00:00", to = "24:00", step = 30) {
 
 mod_questionnaire_ui <- function(id) {
   ns <- NS(id)
-  programs <- q_programs()
-  prog_labels <- setNames(names(programs),
-                          paste0(tools::toTitleCase(names(programs)), " (",
-                                 programs, " min)"))
+  cfg <- q_config()
+  prog_labels <- setNames(names(cfg$programs),
+                          paste0(tools::toTitleCase(names(cfg$programs)), " (",
+                                 cfg$programs, " min)"))
   times <- time_choices()
-  layout_columns(
-    col_widths = c(12, 12),
-    card(
-      card_header("Log in (demo)"),
-      layout_columns(
-        col_widths = c(6, 3),
-        selectInput(ns("user"), "Sample resident", choices = NULL),
-        div(style = "margin-top: 32px;", actionButton(ns("login"), "Log in"))
+  div(
+    class = "p-2",
+    layout_columns(
+      fill = FALSE, col_widths = c(12, 12),
+      card(
+        fill = FALSE,
+        card_header("Log in (demo)"),
+        div(class = "d-flex flex-wrap gap-3 align-items-end",
+            selectInput(ns("user"), "Sample resident",
+                        choices = resident_choices(q_residents()),
+                        selectize = FALSE, width = "16rem"),
+            div(class = "mb-3", actionButton(ns("login"), "Log in"))),
+        textOutput(ns("who"))
       ),
-      textOutput(ns("who"))
-    ),
-    card(
-      card_header("Questionnaire"),
-      selectInput(ns("block"), "Block", choices = q_blocks()),
-      selectInput(ns("course"), "Course", choices = q_courses()),
-      selectInput(ns("program"), "Program", choices = prog_labels),
-      checkboxGroupInput(ns("pref_days"), "Preferred days (optional)",
-                         choices = DAYS, inline = TRUE),
-      selectInput(ns("pref_band"), "Preferred time band (optional)",
-                  choices = c("No preference" = "", q_bands())),
-      tags$hr(),
-      h6("Blocked times (when you are definitely unavailable, including sleep)"),
-      layout_columns(
-        col_widths = c(3, 3, 3, 3),
-        selectInput(ns("b_day"), "Day", choices = DAYS),
-        selectInput(ns("b_start"), "From", choices = times[-length(times)],
-                    selected = "09:00"),
-        selectInput(ns("b_end"), "To", choices = times[-1], selected = "17:00"),
-        div(style = "margin-top: 32px;",
-            actionButton(ns("b_add"), "Add window"))
-      ),
-      actionButton(ns("b_sleep"), "Add sleep 23:00-07:00 to every day",
-                   class = "btn-sm btn-outline-secondary"),
-      uiOutput(ns("b_list")),
-      uiOutput(ns("b_warning")),
-      tags$hr(),
-      actionButton(ns("save"), "Save response", class = "btn-primary"),
-      uiOutput(ns("save_result"))
+      card(
+        fill = FALSE,
+        card_header("Questionnaire"),
+        div(class = "d-flex flex-wrap gap-3",
+            selectInput(ns("block"), "Block", choices = cfg$blocks,
+                        selectize = FALSE, width = "8rem"),
+            textInput(ns("room"), "Room", width = "8rem"),
+            selectInput(ns("course"), "Course", choices = q_courses(),
+                        selectize = FALSE, width = "10rem"),
+            selectInput(ns("program"), "Program", choices = prog_labels,
+                        selectize = FALSE, width = "12rem"),
+            selectInput(ns("pref_band"), "Preferred time band (optional)",
+                        choices = c("No preference" = "", cfg$bands),
+                        selectize = FALSE, width = "14rem")),
+        checkboxGroupInput(ns("pref_days"), "Preferred days (optional)",
+                           choices = cfg$days, inline = TRUE),
+        tags$hr(),
+        h6("Blocked times (when you are definitely unavailable, including sleep)"),
+        p(class = "text-muted small mb-2",
+          "A window can run past midnight: choose a 'To' earlier than 'From'."),
+        div(class = "d-flex flex-wrap gap-3 align-items-end",
+            selectInput(ns("b_day"), "Day", choices = cfg$days,
+                        selectize = FALSE, width = "7rem"),
+            selectInput(ns("b_start"), "From", choices = times[-length(times)],
+                        selected = "09:00", selectize = FALSE, width = "7rem"),
+            selectInput(ns("b_end"), "To", choices = times[-1],
+                        selected = "17:00", selectize = FALSE, width = "7rem"),
+            div(class = "mb-3", actionButton(ns("b_add"), "Add window")),
+            div(class = "mb-3",
+                actionButton(ns("b_sleep"), "Add sleep 23:00-07:00 to every day",
+                             class = "btn-outline-secondary"))),
+        uiOutput(ns("b_list")),
+        uiOutput(ns("b_warning")),
+        tags$hr(),
+        actionButton(ns("save"), "Save response", class = "btn-primary"),
+        uiOutput(ns("save_result"))
+      )
     )
   )
 }
 
 mod_questionnaire_server <- function(id, con = NULL) {
   moduleServer(id, function(input, output, session) {
+    cfg <- q_config()
     residents <- q_residents()
     current_user <- reactiveVal(NULL)
     blocked <- reactiveVal(empty_windows())
     last_response <- reactiveVal(NULL)
     save_msg <- reactiveVal(NULL)
-
-    updateSelectInput(session, "user", choices = setNames(
-      residents$resident_id, paste(residents$resident_id, residents$name)))
 
     user_row <- reactive({
       req(current_user())
@@ -294,46 +340,45 @@ mod_questionnaire_server <- function(id, con = NULL) {
       current_user(input$user)
       save_msg(NULL)
       r <- residents[residents$resident_id == input$user, , drop = FALSE]
-      if (get_col(r, "block") %in% q_blocks()) {
+      if (get_col(r, "block") %in% cfg$blocks) {
         updateSelectInput(session, "block", selected = r$block)
       }
+      updateTextInput(session, "room", value = get_col(r, "room"))
       if (get_col(r, "course") %in% q_courses()) {
         updateSelectInput(session, "course", selected = r$course)
       }
-      if (get_col(r, "program") %in% q_programs() |
-          get_col(r, "program") %in% names(q_programs())) {
+      if (get_col(r, "program") %in% names(cfg$programs)) {
         updateSelectInput(session, "program", selected = r$program)
       }
-      pd <- strsplit(get_col(r, "pref_days"), ";", fixed = TRUE)[[1]]
-      updateCheckboxGroupInput(session, "pref_days", selected = pd)
       updateSelectInput(session, "pref_band",
                         selected = get_col(r, "pref_band"))
+      pd <- strsplit(get_col(r, "pref_days"), ";", fixed = TRUE)[[1]]
+      updateCheckboxGroupInput(session, "pref_days", selected = pd)
       blocked(parse_windows(get_col(r, "blocked")))
     })
 
     observeEvent(input$b_add, {
       s <- hhmm_to_min(input$b_start)
       e <- hhmm_to_min(input$b_end)
-      if (e <= s) {
-        showNotification("'To' must be after 'From'.", type = "error")
+      if (e == s) {
+        showNotification("'To' must differ from 'From'.", type = "error")
         return()
       }
+      if (e < s) e <- e + 1440L  # runs past midnight
       blocked(rbind(blocked(), data.frame(day = input$b_day, start = s, end = e,
                                           stringsAsFactors = FALSE)))
     })
 
     observeEvent(input$b_sleep, {
-      sleep <- rbind(
-        data.frame(day = DAYS, start = 0L, end = hhmm_to_min("07:00")),
-        data.frame(day = DAYS, start = hhmm_to_min("23:00"), end = 1440L))
+      sleep <- parse_windows(paste0(cfg$days, " 23:00-07:00", collapse = ";"))
       blocked(rbind(blocked(), sleep))
     })
 
     output$b_list <- renderUI({
-      m <- merge_windows(blocked())
+      m <- merge_windows(blocked(), cfg$days)
       if (nrow(m) == 0) return(p(class = "text-muted", "No blocked times yet."))
       tagList(
-        p(strong("Blocked (merged): "), format_windows(m)),
+        p(strong("Blocked (merged): "), format_windows(m, cfg$days)),
         actionButton(session$ns("b_clear"), "Clear all",
                      class = "btn-sm btn-outline-danger")
       )
@@ -341,13 +386,14 @@ mod_questionnaire_server <- function(id, con = NULL) {
     observeEvent(input$b_clear, blocked(empty_windows()))
 
     output$b_warning <- renderUI({
-      over <- days_over_limit(blocked())
+      limit <- cfg$max_blocked_hours
+      over <- days_over_limit(blocked(), limit)
       if (length(over) == 0) return(NULL)
       div(class = "alert alert-warning mt-2",
           strong("Warning: "),
           paste0(names(over), " (", round(over, 1), " h)", collapse = ", "),
-          paste0(" blocked for more than ", BLOCKED_LIMIT_HOURS,
-                 " hours. You can still save, but you will have little free time to wash."))
+          paste0(" blocked for more than ", limit, " hours. You can still ",
+                 "save, but you will have little free time to wash."))
     })
 
     observeEvent(input$save, {
@@ -355,9 +401,14 @@ mod_questionnaire_server <- function(id, con = NULL) {
         showNotification("Please log in first.", type = "error")
         return()
       }
+      if (!nzchar(trimws(input$room))) {
+        showNotification("Please enter your room.", type = "error")
+        return()
+      }
       row <- build_response_row(current_user(), user_row()$name, input$block,
-                                input$course, input$program, blocked(),
-                                input$pref_days, input$pref_band)
+                                input$room, input$program, input$course,
+                                blocked(), input$pref_days, input$pref_band,
+                                cfg$days)
       res <- tryCatch(save_response(con, row), error = function(e) e)
       if (inherits(res, "error")) {
         save_msg(div(class = "alert alert-danger mt-2",
