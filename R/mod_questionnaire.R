@@ -25,6 +25,11 @@ PATH_CONFIG <- "data/config.csv"
 PATH_LAST_PLANNED <- "data/fake_last_planned.csv"
 PATH_FAKE_SCHEDULE <- "data/fake_schedule.csv"
 
+# Block rule: each block is single-gender. Gender is only used to limit the
+# block choices; it is not saved in the row.
+BLOCK_GENDER <- c(A = "Female", B = "Female", C = "Female", D = "Male")
+GENDERS <- c("Female", "Male")
+
 SURVEY_COLUMNS <- c("resident_id", "name", "block", "room", "program",
                     "course", "blocked", "pref_days", "pref_band")
 
@@ -245,6 +250,36 @@ resident_choices <- function(residents) {
   setNames(residents$resident_id, paste(residents$resident_id, residents$name))
 }
 
+# Blocks a gender may choose, in the order of `blocks` (default: all known).
+blocks_for_gender <- function(gender, blocks = names(BLOCK_GENDER)) {
+  blocks[!is.na(BLOCK_GENDER[blocks]) & BLOCK_GENDER[blocks] == gender]
+}
+
+block_allowed <- function(gender, block) {
+  g <- unname(BLOCK_GENDER[block])
+  !is.na(g) & g == gender
+}
+
+# Gender implied by a block (NA for an unknown block).
+gender_for_block <- function(block) unname(BLOCK_GENDER[block])
+
+test_block_rule <- function() {
+  stopifnot(identical(blocks_for_gender("Male"), "D"))
+  stopifnot(identical(blocks_for_gender("Female"), c("A", "B", "C")))
+  stopifnot(identical(blocks_for_gender("Female", c("C", "D")), "C"))  # keeps order
+  stopifnot(block_allowed("Male", "D"), block_allowed("Female", "A"),
+            block_allowed("Female", "B"), block_allowed("Female", "C"))
+  stopifnot(!block_allowed("Male", "A"), !block_allowed("Male", "C"),
+            !block_allowed("Female", "D"), !block_allowed("Male", "Z"))
+  stopifnot(identical(gender_for_block("D"), "Male"),
+            identical(gender_for_block("B"), "Female"),
+            is.na(gender_for_block("Z")))
+  # every configured block and every sample resident's block has a gender
+  stopifnot(all(q_config()$blocks %in% names(BLOCK_GENDER)))
+  stopifnot(all(q_residents()$block %in% names(BLOCK_GENDER)))
+  invisible(TRUE)
+}
+
 time_choices <- function(from = "00:00", to = "24:00", step = 30) {
   min_to_hhmm(seq(hhmm_to_min(from), hhmm_to_min(to), by = step))
 }
@@ -276,7 +311,10 @@ mod_questionnaire_ui <- function(id) {
         fill = FALSE,
         card_header("Questionnaire"),
         div(class = "d-flex flex-wrap gap-3",
-            selectInput(ns("block"), "Block", choices = cfg$blocks,
+            selectInput(ns("gender"), "Gender", choices = GENDERS,
+                        selectize = FALSE, width = "8rem"),
+            selectInput(ns("block"), "Block",
+                        choices = blocks_for_gender(GENDERS[1], cfg$blocks),
                         selectize = FALSE, width = "8rem"),
             textInput(ns("room"), "Room", width = "8rem"),
             selectInput(ns("course"), "Course", choices = q_courses(),
@@ -336,12 +374,25 @@ mod_questionnaire_server <- function(id, con = NULL) {
       if (col %in% names(row) && !is.na(row[[col]])) row[[col]] else default
     }
 
+    # Gender decides which blocks can be chosen.
+    observeEvent(input$gender, {
+      choices <- blocks_for_gender(input$gender, cfg$blocks)
+      keep <- isolate(input$block)
+      updateSelectInput(session, "block", choices = choices,
+                        selected = if (keep %in% choices) keep else choices[1])
+    })
+
     observeEvent(input$login, {
       current_user(input$user)
       save_msg(NULL)
       r <- residents[residents$resident_id == input$user, , drop = FALSE]
-      if (get_col(r, "block") %in% cfg$blocks) {
-        updateSelectInput(session, "block", selected = r$block)
+      block <- get_col(r, "block")
+      if (block %in% cfg$blocks && !is.na(gender_for_block(block))) {
+        gender <- gender_for_block(block)  # sample residents: gender from block
+        updateSelectInput(session, "gender", selected = gender)
+        updateSelectInput(session, "block",
+                          choices = blocks_for_gender(gender, cfg$blocks),
+                          selected = block)
       }
       updateTextInput(session, "room", value = get_col(r, "room"))
       if (get_col(r, "course") %in% q_courses()) {
@@ -399,6 +450,15 @@ mod_questionnaire_server <- function(id, con = NULL) {
     observeEvent(input$save, {
       if (is.null(current_user())) {
         showNotification("Please log in first.", type = "error")
+        return()
+      }
+      if (!block_allowed(input$gender, input$block)) {
+        msg <- paste0("Block ", input$block, " is not available for ",
+                      input$gender, ". ", input$gender, " residents can choose ",
+                      "block ", paste(blocks_for_gender(input$gender), collapse = ", "),
+                      ".")
+        save_msg(div(class = "alert alert-danger mt-2", msg))
+        showNotification(msg, type = "error")
         return()
       }
       if (!nzchar(trimws(input$room))) {
