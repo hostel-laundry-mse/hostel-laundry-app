@@ -35,8 +35,57 @@
 #            timetable, since its residents count as free at all those times.
 #
 # db_connect(path)
-#   Takes: path to an SQLite file.
-#   Returns: a DBI connection (RSQLite) used to store responses and schedules.
+#   Takes: path to an SQLite file, created if it does not exist.
+#   Returns: a DBI connection (RSQLite) with the tables below ready to use.
+#
+# db_init(con)
+#   Takes: con - connection from db_connect().
+#   Creates any missing table: bookings, changes, queue (see CLAUDE.md
+#   "Database tables") and responses (the columns save_response() in
+#   R/mod_questionnaire.R writes). Existing tables and rows are kept.
+#   Returns: con, invisibly.
+#
+# read_responses(con)
+#   Returns: data.frame in the same form as load_survey(), empty text as NA.
+# write_responses(con, rows)
+#   Takes: rows - data.frame with the survey columns. Each row replaces that
+#          resident's earlier row, all rows or none.
+#
+# read_bookings(con, person = NULL)
+#   Returns: data.frame(booking_id, person, machine, date, start, end, status,
+#            source), everyone's unless person is given.
+# add_bookings(con, schedule, source = "optimiser", status = "booked")
+#   Takes: schedule - data.frame(person, machine, date, start, end).
+#   Returns: the new booking_ids, in row order. All rows or none are added.
+# set_booking_status(con, booking_id, status)
+#   Stops if there is no such booking.
+#
+# read_changes(con, person = NULL)
+#   Returns: data.frame(person, booking_id, at, kind).
+# add_change(con, person, booking_id, kind, at = Sys.time())
+#   Takes: kind - "change" or "release". booking_id must exist.
+#
+# read_queue(con, status = NULL)
+#   Returns: data.frame(person, requested_at, status), earliest request first.
+# add_to_queue(con, person, requested_at = Sys.time())
+#   Does nothing if the person is already waiting.
+# set_queue_status(con, person, status)
+#   Sets the person's waiting request to "served" or "withdrawn". Stops if
+#   they have none.
+#
+# clear_cycle_plan(con, cycle_start, cycle_days = 10)
+#   Deletes the cycle's optimiser bookings, so a new plan can replace them.
+#   Stops and deletes nothing if the cycle has been used: any booking in it
+#   that is not source = optimiser and status = booked, or that has a row in
+#   changes. The table has no published flag, so a published cycle nobody has
+#   used yet is cleared too; the caller must not call this for one.
+#   Returns: the number of bookings deleted.
+#
+# last_planned(con, cycle_start)
+#   Takes: cycle_start - first date of the cycle (Date or "YYYY-MM-DD").
+#   Returns: data.frame(resident_id, date), each person's last booking with
+#            source = optimiser (any status) dated before cycle_start, as
+#            run_optimiser() takes. People with none have no row.
 
 WEEKDAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -93,8 +142,8 @@ load_config <- function(path = "data/config.csv") {
     stop(path, ": hours,days must use ", paste(WEEKDAYS, collapse = " "),
          ", got: ", h$days, call. = FALSE)
   }
-  open_min <- hhmm_to_min(h$open, paste0(path, ": hours,open"))
-  close_min <- hhmm_to_min(h$close, paste0(path, ": hours,close"))
+  open_min <- parse_hhmm(h$open, paste0(path, ": hours,open"))
+  close_min <- parse_hhmm(h$close, paste0(path, ": hours,close"))
   if (close_min <= open_min) {
     stop(path, ": hours,close must be after hours,open", call. = FALSE)
   }
@@ -138,8 +187,8 @@ load_timetable <- function(path = "data/fake_timetable.csv") {
       stop(where, ": day must be one of ", paste(WEEKDAYS, collapse = " "),
            ", got '", timetable$day[i], "'", call. = FALSE)
     }
-    if (hhmm_to_min(timetable$end[i], where) <=
-        hhmm_to_min(timetable$start[i], where)) {
+    if (parse_hhmm(timetable$end[i], where) <=
+        parse_hhmm(timetable$start[i], where)) {
       stop(where, ": lecture end must be after its start", call. = FALSE)
     }
   }
@@ -147,11 +196,7 @@ load_timetable <- function(path = "data/fake_timetable.csv") {
 }
 
 build_free_windows <- function(survey, timetable, config, cycle_start) {
-  start_date <- tryCatch(as.Date(cycle_start), error = function(e) as.Date(NA))
-  if (length(start_date) != 1 || is.na(start_date)) {
-    stop("cycle_start must be one date, YYYY-MM-DD, got: ",
-         paste(cycle_start, collapse = ", "), call. = FALSE)
-  }
+  start_date <- parse_cycle_start(cycle_start)
 
   rule <- function(name, default) {
     x <- config$rules[[name]]
@@ -160,8 +205,8 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
   dates <- start_date + seq_len(rule("cycle_days", 10)) - 1
   dates <- dates[date_weekday(dates) %in% config$hours$days]
   margin <- rule("lecture_margin_min", 30)
-  open_min <- hhmm_to_min(config$hours$open, "hours,open")
-  close_min <- hhmm_to_min(config$hours$close, "hours,close")
+  open_min <- parse_hhmm(config$hours$open, "hours,open")
+  close_min <- parse_hhmm(config$hours$close, "hours,close")
 
   no_lectures <- setdiff(unique(survey$course), timetable$course)
   if (length(no_lectures) > 0) {
@@ -173,9 +218,9 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
   lectures <- data.frame(
     course = timetable$course,
     day = timetable$day,
-    start = vapply(timetable$start, hhmm_to_min, numeric(1),
+    start = vapply(timetable$start, parse_hhmm, numeric(1),
                    where = "timetable", USE.NAMES = FALSE) - margin,
-    end = vapply(timetable$end, hhmm_to_min, numeric(1),
+    end = vapply(timetable$end, parse_hhmm, numeric(1),
                  where = "timetable", USE.NAMES = FALSE) + margin
   )
 
@@ -189,8 +234,8 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
       free <- subtract_busy(open_min, close_min, today$start, today$end)
       data.frame(resident_id = rep(survey$resident_id[i], nrow(free)),
                  date = rep(format(d), nrow(free)),
-                 from = min_to_hhmm(free$from),
-                 to = min_to_hhmm(free$to))
+                 from = format_hhmm(free$from),
+                 to = format_hhmm(free$to))
     })
     do.call(rbind, per_date)
   })
@@ -204,8 +249,186 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
   out
 }
 
-db_connect <- function(path = "laundry.sqlite") {
-  NULL
+db_connect <- function(path = "data/laundry.sqlite") {
+  if (!dir.exists(dirname(path))) {
+    stop("Folder for the database does not exist: ", dirname(path), call. = FALSE)
+  }
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "PRAGMA foreign_keys = ON")
+  # Each app session has its own connection, so wait for a lock, don't fail.
+  DBI::dbGetQuery(con, "PRAGMA busy_timeout = 5000")
+  db_init(con)
+  con
+}
+
+db_init <- function(con) {
+  statements <- c(
+    "CREATE TABLE IF NOT EXISTS responses (
+       resident_id TEXT PRIMARY KEY,
+       name TEXT, block TEXT, program TEXT, course TEXT,
+       blocked TEXT, pref_days TEXT, pref_band TEXT)",
+    "CREATE TABLE IF NOT EXISTS bookings (
+       booking_id INTEGER PRIMARY KEY AUTOINCREMENT,
+       person TEXT NOT NULL, machine TEXT NOT NULL, date TEXT NOT NULL,
+       start TEXT NOT NULL, \"end\" TEXT NOT NULL,
+       status TEXT NOT NULL CHECK (status IN
+         ('booked', 'checked_in', 'released', 'no_show', 'moved')),
+       source TEXT NOT NULL CHECK (source IN
+         ('optimiser', 'change', 'queue', 'free_now')))",
+    "CREATE TABLE IF NOT EXISTS changes (
+       person TEXT NOT NULL,
+       booking_id INTEGER NOT NULL REFERENCES bookings (booking_id),
+       at TEXT NOT NULL,
+       kind TEXT NOT NULL CHECK (kind IN ('change', 'release')))",
+    "CREATE TABLE IF NOT EXISTS queue (
+       person TEXT NOT NULL, requested_at TEXT NOT NULL,
+       status TEXT NOT NULL CHECK (status IN
+         ('waiting', 'served', 'withdrawn')))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS queue_one_waiting
+       ON queue (person) WHERE status = 'waiting'"
+  )
+  for (statement in statements) DBI::dbExecute(con, statement)
+  invisible(con)
+}
+
+read_responses <- function(con) {
+  rows <- DBI::dbGetQuery(con, "SELECT resident_id, name, block, program, course,
+    blocked, pref_days, pref_band FROM responses ORDER BY resident_id")
+  rows[rows == ""] <- NA_character_
+  rows
+}
+
+write_responses <- function(con, rows) {
+  cols <- c("resident_id", "name", "block", "program", "course", "blocked",
+            "pref_days", "pref_band")
+  require_columns(rows, cols, "write_responses()")
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "DELETE FROM responses WHERE resident_id = ?",
+                   params = list(rows$resident_id))
+    DBI::dbAppendTable(con, "responses", rows[, cols])
+  })
+  invisible(TRUE)
+}
+
+read_bookings <- function(con, person = NULL) {
+  read_rows(con, "SELECT booking_id, person, machine, date, start, \"end\",
+    status, source FROM bookings", "person", person, "date, start, booking_id")
+}
+
+add_bookings <- function(con, schedule, source = "optimiser", status = "booked") {
+  require_columns(schedule, c("person", "machine", "date", "start", "end"),
+                  "add_bookings()")
+  DBI::dbWithTransaction(con, {
+    vapply(seq_len(nrow(schedule)), function(i) {
+      DBI::dbExecute(
+        con,
+        "INSERT INTO bookings (person, machine, date, start, \"end\", status, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params = list(schedule$person[i], schedule$machine[i],
+                      as.character(schedule$date[i]), schedule$start[i],
+                      schedule$end[i], status, source))
+      as.integer(DBI::dbGetQuery(con, "SELECT last_insert_rowid()")[[1]])
+    }, integer(1))
+  })
+}
+
+set_booking_status <- function(con, booking_id, status) {
+  updated <- DBI::dbExecute(con, "UPDATE bookings SET status = ? WHERE booking_id = ?",
+                            params = list(status, booking_id))
+  if (updated == 0) stop("No booking with id ", booking_id, call. = FALSE)
+  invisible(TRUE)
+}
+
+read_changes <- function(con, person = NULL) {
+  read_rows(con, "SELECT person, booking_id, at, kind FROM changes", "person",
+            person, "at")
+}
+
+add_change <- function(con, person, booking_id, kind, at = Sys.time()) {
+  DBI::dbExecute(con, "INSERT INTO changes (person, booking_id, at, kind)
+                       VALUES (?, ?, ?, ?)",
+                 params = list(person, booking_id, time_text(at), kind))
+  invisible(TRUE)
+}
+
+read_queue <- function(con, status = NULL) {
+  read_rows(con, "SELECT person, requested_at, status FROM queue", "status",
+            status, "requested_at")
+}
+
+add_to_queue <- function(con, person, requested_at = Sys.time()) {
+  DBI::dbExecute(con, "INSERT OR IGNORE INTO queue (person, requested_at, status)
+                       VALUES (?, ?, 'waiting')",
+                 params = list(person, time_text(requested_at)))
+  invisible(TRUE)
+}
+
+set_queue_status <- function(con, person, status) {
+  updated <- DBI::dbExecute(
+    con, "UPDATE queue SET status = ? WHERE person = ? AND status = 'waiting'",
+    params = list(status, person))
+  if (updated == 0) stop(person, " is not waiting in the queue", call. = FALSE)
+  invisible(TRUE)
+}
+
+last_planned <- function(con, cycle_start) {
+  DBI::dbGetQuery(
+    con,
+    "SELECT person AS resident_id, MAX(date) AS date FROM bookings
+     WHERE source = 'optimiser' AND date < ?
+     GROUP BY person ORDER BY person",
+    params = list(format(parse_cycle_start(cycle_start))))
+}
+
+clear_cycle_plan <- function(con, cycle_start, cycle_days = 10) {
+  first <- parse_cycle_start(cycle_start)
+  dates <- list(format(first), format(first + cycle_days - 1))
+  DBI::dbWithTransaction(con, {
+    used <- DBI::dbGetQuery(
+      con,
+      "SELECT COUNT(*) FROM bookings b
+       WHERE date BETWEEN ? AND ?
+         AND (source <> 'optimiser' OR status <> 'booked' OR EXISTS
+              (SELECT 1 FROM changes c WHERE c.booking_id = b.booking_id))",
+      params = dates)[[1]]
+    if (used > 0) {
+      stop("Cycle starting ", format(first), " is already in use (", used,
+           " booking(s) changed, checked in or added since planning), ",
+           "so its plan cannot be cleared", call. = FALSE)
+    }
+    DBI::dbExecute(con, "DELETE FROM bookings WHERE date BETWEEN ? AND ?",
+                   params = dates)
+  })
+}
+
+# Runs a SELECT, filtered on one column if value is given.
+read_rows <- function(con, select, col, value, order_by) {
+  if (is.null(value)) {
+    return(DBI::dbGetQuery(con, paste(select, "ORDER BY", order_by)))
+  }
+  DBI::dbGetQuery(con, paste(select, "WHERE", col, "= ? ORDER BY", order_by),
+                  params = list(value))
+}
+
+require_columns <- function(data, cols, where) {
+  missing_cols <- setdiff(cols, names(data))
+  if (length(missing_cols) > 0) {
+    stop(where, ": missing column(s): ", paste(missing_cols, collapse = ", "),
+         call. = FALSE)
+  }
+}
+
+time_text <- function(x) {
+  if (inherits(x, "POSIXt")) format(x, "%Y-%m-%d %H:%M:%S") else as.character(x)
+}
+
+parse_cycle_start <- function(cycle_start) {
+  start_date <- tryCatch(as.Date(cycle_start), error = function(e) as.Date(NA))
+  if (length(start_date) != 1 || is.na(start_date)) {
+    stop("cycle_start must be one date, YYYY-MM-DD, got: ",
+         paste(cycle_start, collapse = ", "), call. = FALSE)
+  }
+  start_date
 }
 
 # Reads a CSV with every column as character and empty cells as NA.
@@ -241,7 +464,7 @@ date_weekday <- function(dates) {
 }
 
 # "HH:MM" to minutes after midnight, 00:00 to 24:00.
-hhmm_to_min <- function(x, where) {
+parse_hhmm <- function(x, where) {
   ok <- !is.na(x) && grepl("^[0-9]{2}:[0-9]{2}$", x)
   if (ok) {
     h <- as.integer(substr(x, 1, 2))
@@ -252,7 +475,7 @@ hhmm_to_min <- function(x, where) {
   h * 60 + m
 }
 
-min_to_hhmm <- function(x) {
+format_hhmm <- function(x) {
   sprintf("%02d:%02d", as.integer(x %/% 60), as.integer(x %% 60))
 }
 
@@ -274,8 +497,8 @@ parse_blocked <- function(blocked, resident_id) {
            call. = FALSE)
     }
     times <- strsplit(sub("^[^ ]+ ", "", item), "-")[[1]]
-    start <- hhmm_to_min(times[1], where)
-    end <- hhmm_to_min(times[2], where)
+    start <- parse_hhmm(times[1], where)
+    end <- parse_hhmm(times[2], where)
     if (start == 1440 || start == end) {
       stop(where, ": start must be before 24:00 and differ from the end",
            call. = FALSE)
