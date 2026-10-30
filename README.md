@@ -35,7 +35,7 @@ Rscript -e "shiny::runApp(launch.browser = TRUE)"
 
 ## Pages
 
-- **Questionnaire**: residents enter block, room, program, course, blocked times and preferences.
+- **Questionnaire**: residents enter block, program, course, blocked times and preferences.
 - **My slots**: a resident's slots, check-in, "can't make it" (change or release), extra-slot queue.
 - **Schedule**: the full schedule for every machine by date, and the "Free now" list.
 - **Admin**: pick the cycle start, run the optimiser and checker, publish; see queue, changes and no-shows.

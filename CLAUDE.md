@@ -43,7 +43,7 @@ What each file does:
 | `R/data_load.R` | `load_survey()`, `load_config()`, `load_timetable()`, `build_free_windows()` (free time per person per date), `db_connect()` and database read/write helpers for the tables below |
 | `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule; `find_alternative_slots()`: options when someone changes a slot; `pick_from_queue()`: who gets a released slot |
 | `R/checker.R` | `check_schedule()`: validates a schedule against every rule below, returns problems |
-| `R/mod_questionnaire.R` | Questionnaire page: block, room, program, course, blocked times (with the 10-hour check), preferences |
+| `R/mod_questionnaire.R` | Questionnaire page: block, program, course, blocked times (with the 10-hour check), preferences |
 | `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows |
 | `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" flow, changes left, join the extra-slot queue. Schedule page: all machines by date, "Free now" list |
 | `data/config.csv` | Machines, programs, opening hours, rules |
@@ -128,7 +128,6 @@ eligible resident can claim it, first come first served.
 | `resident_id` | string, unique | `R001` |
 | `name` | string | `Aarav Okafor` |
 | `block` | string, matches a `machines` key in config | `B` |
-| `room` | string | `B146` |
 | `program` | string, matches a `program` key in config | `cotton` |
 | `course` | string, matches a `course` in the timetable | `BTECH-CSE-Y2` |
 | `blocked` | `;`-separated weekly `Day HH:MM-HH:MM` times the person can't wash, sleep included, at most 10 h per day; an end before the start means it runs past midnight | `Mon 23:30-07:30;Sat 07:00-09:00` |
