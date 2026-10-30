@@ -1,7 +1,9 @@
 # Hostel Laundry Slot Scheduler
 
-A Shiny app that collects residents' laundry preferences and builds a weekly
-washing-machine schedule with an integer program (ompr + GLPK).
+A Shiny app that books every hostel resident into a washing machine twice
+per 10-day cycle, 4-5 days apart, around their lectures and blocked times,
+using an integer program (ompr + GLPK). Residents can check in, change or
+release a slot, and queue for slots others release.
 
 ## Requirements
 
@@ -33,14 +35,15 @@ Rscript -e "shiny::runApp(launch.browser = TRUE)"
 
 ## Pages
 
-- **Questionnaire**: residents enter block, room, program, loads per week and availability.
-- **My slots**: a resident's assigned slots.
-- **Schedule**: the full schedule for every machine.
-- **Admin**: load data, run the optimiser and checker, publish the schedule.
+- **Questionnaire**: residents enter block, room, program, course, blocked times and preferences.
+- **My slots**: a resident's slots, check-in, "can't make it" (change or release), extra-slot queue.
+- **Schedule**: the full schedule for every machine by date, and the "Free now" list.
+- **Admin**: pick the cycle start, run the optimiser and checker, publish; see queue, changes and no-shows.
 
 ## Data
 
-- `data/config.csv`: machines per block, programs and durations, opening hours.
+- `data/config.csv`: machines per block, programs and durations, opening hours, scheduling rules.
+- `data/timetable.csv`: weekly lecture timetable per course.
 - `data/fake_survey.csv`: made-up residents for development.
 - `data/fake_schedule.csv`: a valid schedule for testing the results pages and checker.
 - `data/fake_schedule_bad.csv`: a schedule that breaks the rules, for testing the checker.
