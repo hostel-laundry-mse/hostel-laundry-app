@@ -1,7 +1,7 @@
 resident_id,name,block,room,program,course,blocked,pref_days,pref_band
 R001,Kiran Okafor,A,A101,quick,DS,Mon 23:00-07:00;Tue 14:00-15:00,Sat,morning
 R002,Noor Mehta,A,A204,normal,AE,Sat 07:00-11:00;Sun 07:00-11:00;Wed 22:00-24:00,,
-R003,Sam Iyer,A,A310,normal,IMA,Tue 23:30-07:30;Thu 17:00-19:00,Tue;Thu,afternoon
+R003,Sam Iyer,A,A310,normal,EE,Tue 23:30-07:30;Thu 17:00-19:00,Tue;Thu,afternoon
 R004,Alex Nair,B,B112,quick,MBA,Mon 07:00-09:00;Fri 20:00-24:00,,morning
 R005,Robin Das,B,B207,normal,FE,Sat 12:00-16:00;Sun 23:00-08:00,Sun,
 R006,Jordan Pillai,B,B305,quick,GE,Wed 07:00-10:00;Wed 20:00-23:00,,
