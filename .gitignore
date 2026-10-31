@@ -15,3 +15,6 @@ data/*
 
 # Databases
 *.sqlite
+
+# Response exports from export_responses(): real names and emails
+*.rds

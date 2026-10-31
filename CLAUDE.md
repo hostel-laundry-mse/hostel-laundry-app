@@ -18,6 +18,8 @@ can join a queue for extra slots that others release.
 - **renv**: package versions locked in `renv.lock`. After clone, run `renv::restore()`.
 
 Run with `shiny::runApp()`. Files in `R/` are sourced automatically.
+The app assumes the laptops it runs on are set to India time (IST): slot
+times, check-in and the change cutoff all use the computer's clock.
 
 ## File ownership
 
@@ -31,7 +33,7 @@ each file.
 |---|---|---|
 | Lead | App wiring, shared docs, packages | `app.R`, `CLAUDE.md`, `README.md`, `.gitignore`, `renv.lock` |
 | Person 1 | Optimiser and slot rules | `R/optimiser.R` |
-| Person 2 | Data, free time, database, checker | `R/data_load.R`, `R/checker.R`, `data/config.csv`, `data/timetable.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
+| Person 2 | Data, free time, database, checker | `R/data_load.R`, `R/checker.R`, `R/simulate_blockC.R`, `data/config.csv`, `data/timetable.csv`, `data/fake_timetable.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv`, `data/fake_last_planned.csv`, `data/participants.csv` (git-ignored) |
 | Person 3 | Questionnaire and admin pages | `R/mod_questionnaire.R`, `R/mod_admin.R` |
 | Person 4 | Resident pages after the schedule is out | `R/mod_results.R` (My slots and Schedule pages), `dev/` (test scripts for these pages) |
 
@@ -43,14 +45,18 @@ What each file does:
 | `R/data_load.R` | `load_survey()`, `load_config()`, `load_timetable()`, `build_free_windows()` (free time per person per date), `db_connect()` and database read/write helpers for the tables below |
 | `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule; `find_alternative_slots()`: options when someone changes a slot; `pick_from_queue()`: who gets a released slot |
 | `R/checker.R` | `check_schedule()`: validates a schedule against every rule below, returns problems |
+| `R/simulate_blockC.R` | `simulate_blockC()`: simulated block C residents (survey format) for the pre-pilot; defines functions only, nothing runs on app start |
 | `R/mod_questionnaire.R` | Questionnaire page: block, program, course, blocked times (with the 10-hour check), preferences |
 | `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows. `mod_admin_server()` returns only the published schedule (NULL until Publish), since the resident pages save whatever it returns as real bookings |
 | `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" flow, changes left, join the extra-slot queue. Schedule page: all machines by date, "Free now" list |
 | `data/config.csv` | Machines, programs, opening hours, rules |
-| `data/timetable.csv` | Weekly lecture timetable per course (public data) |
+| `data/timetable.csv` | Weekly lecture timetable per course (public data): the real one, used for the pre-pilot |
+| `data/fake_timetable.csv` | Small made-up timetable, for tests |
+| `data/participants.csv` | Real names and emails of the people allowed to log in, loaded into `residents`. Git-ignored: never commit it |
 | `data/fake_survey.csv` | Made-up residents (survey format) |
 | `data/fake_schedule.csv` | A valid schedule (schedule format) |
 | `data/fake_schedule_bad.csv` | A schedule that breaks the checker's rules |
+| `data/fake_last_planned.csv` | Made-up last booking dates from a previous cycle, for tests |
 
 ## Workflow
 
@@ -205,11 +211,34 @@ with one row per booking:
 
 SQLite, created and accessed through helpers in `R/data_load.R`:
 
-- `bookings`: `booking_id, person, machine, date, start, end, status, source`.
-  `status` is `booked`, `checked_in`, `released`, `no_show` or `moved`;
+- `bookings`: `booking_id, person, machine, date, start, end, status, source, checked_in_at, finished_at`.
+  `checked_in_at` and `finished_at` are local time, `YYYY-MM-DD HH:MM:SS`,
+  empty until set. `status` is `booked`, `checked_in`, `released`,
+  `no_show`, `moved` or `finished`. Use `check_in()` and `check_out()` to set
+  them; `set_booking_status()` refuses `finished`.
   `source` is `optimiser`, `change`, `queue` or `free_now`.
   A change marks the old row `moved` and adds a new row, so rows with
   `source = optimiser` (any status) always hold the planned dates used for
   the next cycle's gap.
 - `changes`: `person, booking_id, at, kind` (`change` or `release`), used for the 3-per-30-days limit.
 - `queue`: `person, requested_at, status` (`waiting`, `served`, `withdrawn`).
+- `residents`: `resident_id, name, email, block`. The people allowed to log
+  in, loaded from `data/participants.csv` (git-ignored, emails must end in
+  `@mse.ac.in`). `write_residents()` replaces the whole list; someone removed
+  loses login but keeps their consents, bookings and feedback.
+- `consents`: `resident_id, agreed_at, terms_version`. One row per resident
+  and version, keeping the first `agreed_at`.
+- `feedback`: `feedback_id, booking_id, person, rating, comment, at`. Rating
+  is 1 to 5, only for a `finished` booking, at most one per booking.
+
+`db_init()` adds new tables and upgrades an older `bookings` table without
+losing data. `responses` keeps exactly the columns the questionnaire writes.
+
+**Sharing between laptops.** Answers are collected on several laptops, each
+with its own database. `export_responses(con, path)` writes responses,
+residents and consents to one `.rds` file (real names and emails, do not
+commit). `import_responses(con, paths, prefer = NULL)` merges files into
+this database, all or nothing: different answers for the same resident stop
+the import and list them, until `prefer` names the file (or `"database"`)
+that wins. Consents keep the earliest `agreed_at`. Bookings are never
+shared: the schedule is made once, after merging, on one laptop.
