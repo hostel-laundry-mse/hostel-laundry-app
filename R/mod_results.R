@@ -8,10 +8,12 @@
 #                    current_user = NULL, now = NULL, cycle_start = NULL,
 #                    refresh_ms = 3000)
 #   Takes: id           - module id
-#          schedule     - reactive schedule data.frame (person, machine, date,
-#                         start, end) from mod_admin_server(), or NULL. If the
-#                         database has no bookings in its dates yet, it is
-#                         saved with add_bookings() so it can be checked into.
+#          schedule     - reactive from mod_admin_server(): the published
+#                         schedule, or NULL until Publish. Used only as a
+#                         signal to refresh. Bookings are always read from the
+#                         database with read_bookings(con), which is where
+#                         Publish saves them, so slots still show after the
+#                         app restarts (when the Admin reactive is NULL again).
 #          view         - "mine" or "all"
 #          con          - DBI connection from db_connect(). NULL opens one.
 #          current_user - reactive resident_id of the logged-in resident. NULL
@@ -44,6 +46,10 @@
 #                  are used: they apply the same rules.
 #   R/mod_questionnaire.R  PATH_SURVEY, PATH_TIMETABLE, PATH_CONFIG (the
 #                  files the Admin page uses), if defined.
+#
+# Until the database has any bookings, both pages say "No schedule published
+# yet." Nothing here ever writes the Admin page's schedule to the database:
+# only Publish (R/mod_admin.R) does that.
 #
 # Every function and constant here starts with res_ / RES_ so nothing clashes
 # with the other files, which are all sourced into the same environment.
@@ -165,18 +171,6 @@ res_in_cycle <- function(dates, cycle_start, s) {
 }
 
 # ---- Housekeeping --------------------------------------------------------------
-
-# Saves the Admin page's schedule if none of its dates have bookings yet.
-res_sync_schedule <- function(con, schedule) {
-  if (is.null(schedule) || !is.data.frame(schedule) || nrow(schedule) == 0) return(0)
-  if (!"date" %in% names(schedule)) return(0)
-  dates <- range(as.Date(schedule$date))
-  have <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM bookings WHERE date BETWEEN ? AND ?",
-                          params = list(format(dates[1]), format(dates[2])))$n
-  if (have > 0) return(0)
-  add_bookings(con, schedule[, c("person", "machine", "date", "start", "end")])
-  nrow(schedule)
-}
 
 # Booked slots nobody checked into within the grace time become no-shows.
 res_expire_no_shows <- function(con, now, s) {
@@ -570,10 +564,13 @@ mod_results_ui <- function(id, view = c("mine", "all")) {
       card_body(
         fillable = FALSE,
         res_css, user_box,
-        uiOutput(ns("summary")),
-        uiOutput(ns("cards")),
-        h5("Extra slot"),
-        uiOutput(ns("queue_box"))
+        uiOutput(ns("notice")),
+        conditionalPanel(
+          "output.published", ns = ns,
+          uiOutput(ns("summary")),
+          uiOutput(ns("cards")),
+          h5("Extra slot"),
+          uiOutput(ns("queue_box")))
       )
     )
   } else {
@@ -583,6 +580,9 @@ mod_results_ui <- function(id, view = c("mine", "all")) {
       card_body(
       fillable = FALSE,
       res_css, user_box,
+      uiOutput(ns("notice")),
+      conditionalPanel(
+      "output.published", ns = ns,
       h5("Free now"),
       p(class = "res-hint", style = "margin-left:0",
         "Released slots anyone in that block can claim, first come first served."),
@@ -593,7 +593,7 @@ mod_results_ui <- function(id, view = c("mine", "all")) {
           radioButtons(ns("which_block"), "Show",
                        c("My block" = "mine", "All blocks" = "all"), inline = TRUE)),
       div(style = "margin-top:8px", plotOutput(ns("grid"), height = "640px")),
-      div(downloadButton(ns("download"), "Download this cycle (CSV)"))
+      div(downloadButton(ns("download"), "Download this cycle (CSV)")))
       )
     )
   }
@@ -629,19 +629,26 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
     }, function() TRUE)
     bump <- reactiveVal(0)
 
-    # Save the Admin page's schedule once, so it can be checked into.
+    # Publish on the Admin page saves the bookings; refresh straight away
+    # instead of waiting for the next poll. The schedule itself is not used.
     if (is.function(schedule)) {
-      observe({
-        sch <- schedule()
-        n <- tryCatch(res_sync_schedule(con, sch), error = function(e) 0)
-        if (n > 0) bump(bump() + 1)
-      })
+      observeEvent(schedule(), bump(isolate(bump()) + 1), ignoreNULL = FALSE)
     }
 
     ctx <- reactive({
       db_state(); bump()
       cs <- if (is.null(cycle_start)) NULL else cycle_start()
       res_context(con, config, clock(), cs, fw_cache)
+    })
+
+    # Has anything been published? Both pages show a notice until it has.
+    published <- reactive(nrow(ctx()$bookings) > 0)
+    output$published <- reactive(published())
+    outputOptions(output, "published", suspendWhenHidden = FALSE)
+    output$notice <- renderUI({
+      if (published()) return(NULL)
+      div(class = "res-info", strong("No schedule published yet."), br(),
+          "Your slots will appear here once the admin publishes this cycle's schedule.")
     })
 
     # Who is signed in: from app.R if given, otherwise a dropdown here.
@@ -678,7 +685,7 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
     # ---- My slots -----------------------------------------------------------
     output$summary <- renderUI({
       x <- ctx(); p <- me()
-      if (is.na(x$cycle_start)) return(div(class = "res-info", "No schedule has been published yet."))
+      if (is.na(x$cycle_start)) return(NULL)
       div(class = "res-info",
           strong(sprintf("Cycle: %s to %s", res_day(x$cycle_start),
                          res_day(x$cycle_start + x$s$cycle_days - 1))), br(),

@@ -16,7 +16,7 @@ check <- function(desc, cond) {
 }
 fresh <- function() {
   con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
-  res_sync_schedule(con, sched); con
+  add_bookings(con, sched); con          # what Publish on the Admin page does
 }
 ctx_at <- function(con, d, hm) res_context(con, config, at(d, hm))
 bid <- function(con, p, d) {
@@ -35,8 +35,7 @@ dbDisconnect(con)
 
 # ---- 1. schedule saved once, cycle found -------------------------------------
 con <- fresh()
-check("Admin schedule saved into bookings (24 rows)", nrow(read_bookings(con)) == 24)
-check("saving again adds nothing", res_sync_schedule(con, sched) == 0 && nrow(read_bookings(con)) == 24)
+check("published schedule is read from bookings (24 rows)", nrow(res_context(con, config, at("2026-11-03", "09:00"))$bookings) == 24)
 x <- ctx_at(con, "2026-11-03", "09:00")
 check("current cycle starts Mon 02 Nov", x$cycle_start == as.Date("2026-11-02"))
 check("free windows built for everyone", length(unique(x$fw$resident_id)) == 12)
@@ -199,19 +198,26 @@ x <- ctx_at(con, "2026-11-07", "15:01")
 check("not on Free now once it has started", nrow(res_free_now(x, "R009")) == 0)
 dbDisconnect(con)
 
-# ---- 9. the Shiny module, wired the way app.R does today ------------------------------
-tmp <- tempfile(); dir.create(file.path(tmp, "data"), recursive = TRUE)
-for (f in list.files("data", full.names = TRUE)) file.copy(f, file.path(tmp, "data"))
-old <- setwd(tmp)
-sch <- reactiveVal(sched)
-testServer(mod_results_server, args = list(schedule = sch, view = "mine",
-                                           now = reactive(at("2026-11-03", "10:05"))), {
+# ---- 9. the Shiny module, wired the way app.R does (lead-wiring) ----------------
+con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
+sch <- reactiveVal(NULL)                       # Admin returns NULL until Publish
+testServer(mod_results_server, args = list(schedule = sch, view = "mine", con = con,
+                                           current_user = NULL,
+                                           now = reactive(at("2026-11-03", "10:05")),
+                                           refresh_ms = 100), {
   session$flushReact()
+  check("before Publish: 'No schedule published yet.'",
+        grepl("No schedule published yet", output$notice$html) && !published())
+  sch(sched); session$flushReact()            # e.g. a demo schedule shown on Admin
+  check("an unpublished schedule from Admin is NEVER saved to the database",
+        nrow(read_bookings(con)) == 0 && grepl("No schedule published yet", output$notice$html))
+  add_bookings(con, sched)                     # Publish saves the bookings
+  session$elapse(200); session$flushReact()
   session$setInputs(user = "R001")
-  check("app.R-style call (no con, no user): page works with its own sign-in dropdown",
+  check("after Publish: notice gone, bookings read with read_bookings()",
+        published() && is.null(output$notice))
+  check("app.R passes no user: page shows its own sign-in dropdown",
         grepl("Signed in as", output$user_box$html))
-  check("schedule from Admin was saved to data/laundry.sqlite",
-        file.exists("data/laundry.sqlite") && nrow(read_bookings(con)) == 24)
   check("R001 sees both slots", grepl("Tue 03 Nov, 10:00-10:30", output$cards$html) &&
         grepl("Sat 07 Nov, 09:00-09:30", output$cards$html))
   check("summary shows 3 changes left", grepl("Changes left: 3 of 3", output$summary$html))
@@ -225,18 +231,30 @@ testServer(mod_results_server, args = list(schedule = sch, view = "mine",
   check("Move from the dialog works", status_of(con, i2) == "moved" &&
         grepl("Changes left: 2 of 3", output$summary$html))
   check("queue box shown", grepl("queue|used both", output$queue_box$html))
+  sch(NULL); session$flushReact()              # new app session: Admin reactive is NULL again
+  check("Admin back to NULL (e.g. app restarted): published slots still show",
+        published() && grepl("Sat 07 Nov|Tue 03 Nov", output$cards$html))
 })
-testServer(mod_results_server, args = list(view = "all", current_user = reactive("R007"),
-                                           now = reactive(at("2026-11-07", "13:00"))), {
+dbDisconnect(con)
+
+con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
+testServer(mod_results_server, args = list(view = "all", con = con,
+                                           current_user = reactive("R007"),
+                                           now = reactive(at("2026-11-07", "13:00")),
+                                           refresh_ms = 100), {
   session$flushReact()
+  check("Schedule page before Publish: 'No schedule published yet.'",
+        grepl("No schedule published yet", output$notice$html))
+  add_bookings(con, sched); session$elapse(200); session$flushReact()
   session$setInputs(date = "2026-11-03", which_block = "all")
-  check("Schedule page: no dropdown when app.R passes the user", is.null(output$user_box))
+  check("Schedule page after Publish: notice gone", is.null(output$notice))
+  check("no dropdown when app.R passes the user", is.null(output$user_box))
   check("Schedule grid draws", !is.null(output$grid$src))
   session$setInputs(date = "2026-11-11", which_block = "mine")
   check("a day with no bookings in my block still draws the empty grid", !is.null(output$grid$src))
   check("Free now renders", grepl("Nothing free|Claim", output$free_now$html))
   d <- read.csv(output$download)
-  check("download has this cycle's active bookings", nrow(d) >= 23)
+  check("download has this cycle's bookings", nrow(d) == 24)
 })
-setwd(old)
+dbDisconnect(con)
 cat("\nAll", n_ok, "checks passed.\n")
