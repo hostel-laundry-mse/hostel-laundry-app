@@ -175,6 +175,41 @@ test_released_schedule <- function() {
   invisible(TRUE)
 }
 
+# The schedule for display: a `name` column (from read_residents()) right after
+# `person`, blank for an id that is not in residents. Only the table on this
+# page uses it; the schedule itself, and what Publish saves, stay unchanged.
+with_names <- function(schedule, residents) {
+  name <- if (is.data.frame(residents)) {
+    residents$name[match(schedule$person, residents$resident_id)]
+  } else {
+    rep(NA_character_, nrow(schedule))
+  }
+  name[is.na(name)] <- ""
+  out <- schedule
+  out$name <- name
+  out[, c("person", "name", setdiff(names(schedule), "person")), drop = FALSE]
+}
+
+test_schedule_names <- function() {
+  sched <- data.frame(person = c("P001", "X999", "P002"),
+                      machine = c("A-1", "A-2", "B-1"),
+                      date = "2026-11-03", start = "09:00", end = "09:30")
+  residents <- data.frame(resident_id = c("P002", "P001"),
+                          name = c("Dev Test", "Priya Test"),
+                          email = c("d@mse.ac.in", "p@mse.ac.in"),
+                          block = c("D", "B"))
+  out <- with_names(sched, residents)
+  stopifnot(identical(names(out), c("person", "name", "machine", "date", "start", "end")))
+  stopifnot(identical(out$name, c("Priya Test", "", "Dev Test")))  # unknown id: blank
+  stopifnot(identical(out$person, sched$person), nrow(out) == nrow(sched))
+  # the schedule itself is not changed
+  stopifnot(identical(names(sched), c("person", "machine", "date", "start", "end")))
+  # no residents available: every name blank
+  stopifnot(all(with_names(sched, NULL)$name == ""))
+  stopifnot(nrow(with_names(sched[0, ], residents)) == 0)
+  invisible(TRUE)
+}
+
 # Existing bookings dated inside the cycle.
 cycle_bookings <- function(con, cycle_start, cycle_days = 10) {
   first <- as.Date(cycle_start)
@@ -414,7 +449,11 @@ mod_admin_server <- function(id, con = NULL) {
     })
     output$schedule_table <- DT::renderDT({
       req(schedule())
-      DT::datatable(schedule(), rownames = FALSE, fillContainer = FALSE)
+      residents <- if (is.null(con)) NULL else {
+        tryCatch(read_residents(con), error = function(e) NULL)
+      }
+      DT::datatable(with_names(schedule(), residents), rownames = FALSE,
+                    fillContainer = FALSE)
     })
 
     # Activity tabs read the database tables; they refresh after a publish.
