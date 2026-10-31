@@ -24,11 +24,18 @@ ui <- page_navbar(
 
 server <- function(input, output, session) {
   con <- db_connect()
+  session$onSessionEnded(function() DBI::dbDisconnect(con))
+
+  # No login yet: current_user is NULL, so the resident pages show their own
+  # "Signed in as" dropdown. Pass a reactive resident_id here once login exists.
+  current_user <- NULL
 
   mod_questionnaire_server("questionnaire", con)
   schedule <- mod_admin_server("admin", con)
-  mod_results_server("my_slots", schedule, view = "mine")
-  mod_results_server("schedule", schedule, view = "all")
+  mod_results_server("my_slots", schedule, view = "mine", con = con,
+                     current_user = current_user)
+  mod_results_server("schedule", schedule, view = "all", con = con,
+                     current_user = current_user)
 }
 
 shinyApp(ui, server)

@@ -33,7 +33,7 @@ each file.
 | Person 1 | Optimiser and slot rules | `R/optimiser.R` |
 | Person 2 | Data, free time, database, checker | `R/data_load.R`, `R/checker.R`, `data/config.csv`, `data/timetable.csv`, `data/fake_survey.csv`, `data/fake_schedule.csv`, `data/fake_schedule_bad.csv` |
 | Person 3 | Questionnaire and admin pages | `R/mod_questionnaire.R`, `R/mod_admin.R` |
-| Person 4 | Resident pages after the schedule is out | `R/mod_results.R` (My slots and Schedule pages) |
+| Person 4 | Resident pages after the schedule is out | `R/mod_results.R` (My slots and Schedule pages), `dev/` (test scripts for these pages) |
 
 What each file does:
 
@@ -44,7 +44,7 @@ What each file does:
 | `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule; `find_alternative_slots()`: options when someone changes a slot; `pick_from_queue()`: who gets a released slot |
 | `R/checker.R` | `check_schedule()`: validates a schedule against every rule below, returns problems |
 | `R/mod_questionnaire.R` | Questionnaire page: block, program, course, blocked times (with the 10-hour check), preferences |
-| `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows |
+| `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows. `mod_admin_server()` returns only the published schedule (NULL until Publish), since the resident pages save whatever it returns as real bookings |
 | `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" flow, changes left, join the extra-slot queue. Schedule page: all machines by date, "Free now" list |
 | `data/config.csv` | Machines, programs, opening hours, rules |
 | `data/timetable.csv` | Weekly lecture timetable per course (public data) |
@@ -172,6 +172,8 @@ optimiser takes, one row per free stretch of time:
 - `hours,buffer_min,<minutes>`: machine time reserved after each wash (default 10)
 - `rules,grid_min,<minutes>`: time block length (default 30)
 - `rules,cycle_days,<days>`: cycle length (default 10)
+- `rules,slots_per_cycle,<n>`: bookings per person per cycle (default 2; the optimiser supports only 2)
+- `rules,second_slot_min_day,<day>`: earliest cycle day for the second booking (default cycle_days - gap_max_days + 1, i.e. 6)
 - `rules,gap_min_days,<days>` and `rules,gap_max_days,<days>`: days between a person's consecutive bookings (default 4 and 5)
 - `rules,lecture_margin_min,<minutes>`: unavailable time before and after each lecture (default 30)
 - `rules,max_blocked_hours,<hours>`: personal blocked time allowed per day, sleep included (default 10)
