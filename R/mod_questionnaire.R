@@ -20,7 +20,7 @@
 
 # ---- File paths (the only place they are written) ----------------------------
 PATH_SURVEY <- "data/fake_survey.csv"
-PATH_TIMETABLE <- "data/fake_timetable.csv"  # CLAUDE.md: data/timetable.csv
+PATH_TIMETABLE <- "data/timetable.csv"
 PATH_CONFIG <- "data/config.csv"
 PATH_LAST_PLANNED <- "data/fake_last_planned.csv"
 PATH_FAKE_SCHEDULE <- "data/fake_schedule.csv"
@@ -249,17 +249,23 @@ test_response_row <- function() {
   invisible(TRUE)
 }
 
-# Saves one row, replacing that resident's earlier row. With con = NULL (the
-# database is not ready) nothing is written. Returns list(saved, row).
-# TODO: table name "responses" is a guess until the database tables exist.
+# Saves one row with write_responses(), which replaces that resident's earlier
+# row. With con = NULL (no database) nothing is written.
+# Returns list(saved, row).
 save_response <- function(con, row) {
   if (is.null(con)) return(list(saved = FALSE, row = row))
-  if (DBI::dbExistsTable(con, "responses")) {
-    DBI::dbExecute(con, "DELETE FROM responses WHERE resident_id = ?",
-                   params = list(row$resident_id))
-  }
-  DBI::dbWriteTable(con, "responses", row, append = TRUE)
+  write_responses(con, row)
   list(saved = TRUE, row = row)
+}
+
+# The resident's saved row from the database (survey format), or NULL if they
+# have none or there is no database.
+saved_response <- function(con, resident_id) {
+  if (is.null(con)) return(NULL)
+  rows <- tryCatch(read_responses(con), error = function(e) NULL)
+  if (is.null(rows)) return(NULL)
+  row <- rows[rows$resident_id == resident_id, , drop = FALSE]
+  if (nrow(row) == 0) NULL else row
 }
 
 resident_choices <- function(residents) {
@@ -374,6 +380,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
     blocked <- reactiveVal(empty_windows())
     last_response <- reactiveVal(NULL)
     save_msg <- reactiveVal(NULL)
+    prefill_from <- reactiveVal("sample")
 
     user_row <- reactive({
       req(current_user())
@@ -382,7 +389,10 @@ mod_questionnaire_server <- function(id, con = NULL) {
 
     output$who <- renderText({
       if (is.null(current_user())) "Not logged in."
-      else paste("Logged in as", current_user(), "-", user_row()$name)
+      else paste0("Logged in as ", current_user(), " - ", user_row()$name,
+                  if (prefill_from() == "saved") {
+                    ". Form filled from your saved response."
+                  } else ".")
     })
 
     get_col <- function(row, col, default = "") {
@@ -400,7 +410,11 @@ mod_questionnaire_server <- function(id, con = NULL) {
     observeEvent(input$login, {
       current_user(input$user)
       save_msg(NULL)
-      r <- residents[residents$resident_id == input$user, , drop = FALSE]
+      r <- saved_response(con, input$user)
+      prefill_from(if (is.null(r)) "sample" else "saved")
+      if (is.null(r)) {
+        r <- residents[residents$resident_id == input$user, , drop = FALSE]
+      }
       block <- get_col(r, "block")
       if (block %in% cfg$blocks && !is.na(gender_for_block(block))) {
         gender <- gender_for_block(block)  # sample residents: gender from block
