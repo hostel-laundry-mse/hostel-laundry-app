@@ -23,7 +23,7 @@ days <- format(as.Date("2026-11-02") + 0:9)
 
 seed <- function(con, now) {
   for (t in c("changes", "queue", "bookings")) DBI::dbExecute(con, paste("DELETE FROM", t))
-  res_sync_schedule(con, sched)
+  add_bookings(con, sched)          # what Publish on the Admin page does
   b <- read_bookings(con)
   used <- b$booking_id[res_dt(b$date, b$end) < now]
   for (id in used) set_booking_status(con, id, "checked_in")
