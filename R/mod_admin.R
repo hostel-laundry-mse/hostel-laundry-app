@@ -7,8 +7,10 @@
 #
 # mod_admin_server(id, con)
 #   Takes: module id, con - DBI connection from db_connect().
-#   Returns: reactive giving the current schedule data.frame
-#            (person, machine, date, start, end), or NULL before one is run.
+#   Returns: reactive giving the published schedule data.frame
+#            (person, machine, date, start, end), or NULL until Publish has
+#            succeeded. NULL again after a new Generate. A demo or stand-in
+#            schedule is never returned.
 #
 # Generate reads the answers with read_responses(con). With no answers it
 # refuses ("No responses yet"). The "Use demo data" box instead uses
@@ -21,8 +23,6 @@
 # bookings it asks for a confirmation click first. The published flag is set
 # only after add_bookings() succeeds, and the schedule stays in memory so a
 # failed publish can be retried.
-# TODO: the returned reactive is not gated on "published" because the return
-# value is fixed by the contract above.
 
 DEFAULT_CYCLE_START <- as.Date("2026-11-02")
 
@@ -157,6 +157,23 @@ run_pipeline <- function(cycle_start, survey, last_planned_df = NULL,
 }
 
 # ---- Publishing --------------------------------------------------------------
+
+# What the module returns: the schedule only once it has been published from
+# the optimiser. Demo and stand-in schedules are never published.
+released_schedule <- function(published, source, schedule) {
+  if (isTRUE(published) && identical(source, "optimiser")) schedule else NULL
+}
+
+test_released_schedule <- function() {
+  sched <- data.frame(person = "R001", machine = "A-1", date = "2026-11-03",
+                      start = "09:00", end = "09:30")
+  stopifnot(identical(released_schedule(TRUE, "optimiser", sched), sched))
+  stopifnot(is.null(released_schedule(FALSE, "optimiser", sched)))  # not yet published
+  stopifnot(is.null(released_schedule(TRUE, "demo", sched)))
+  stopifnot(is.null(released_schedule(TRUE, "fallback", sched)))
+  stopifnot(is.null(released_schedule(TRUE, NULL, sched)))
+  invisible(TRUE)
+}
 
 # Existing bookings dated inside the cycle.
 cycle_bookings <- function(con, cycle_start, cycle_days = 10) {
@@ -425,6 +442,6 @@ mod_admin_server <- function(id, con = NULL) {
       if (has_rows(noshows_df())) tableOutput(session$ns("noshows_tbl")) else no_data)
     output$noshows_tbl <- renderTable(noshows_df())
 
-    schedule
+    reactive(released_schedule(published(), generated()$source, schedule()))
   })
 }
