@@ -1,5 +1,7 @@
-# Questionnaire module: a sample resident logs in, then enters their block,
-# course, wash program, blocked times and preferences.
+# Questionnaire module: a resident enters their @mse.ac.in email, then their
+# name, block, course, wash program, blocked times and preferences, and agrees
+# to the Terms of Use. A "Demo login (testing only)" option lets a sample
+# resident be used instead.
 #
 # mod_questionnaire_ui(id)
 #   Takes: module id.
@@ -17,6 +19,15 @@
 # `blocked` is `;`-separated `Day HH:MM-HH:MM`. An end before the start runs
 # past midnight (Mon 23:00-07:00) and counts towards the day it starts on; an
 # end of 24:00 means midnight.
+#
+# Identity. The resident signs in with an email ending in @mse.ac.in (format
+# check only, no password). Until the database has an email column
+# (SAVE_EXTRA_COLUMNS is FALSE) the lowercased email is used as resident_id.
+# Once the columns exist, flip SAVE_EXTRA_COLUMNS to TRUE: the first save then
+# generates resident_id "R_" + block + a 2-digit number (R_C01), numbered per
+# block from the highest existing number + 1, found again by email afterwards
+# and never changed; email, consent and consent_at are saved as extra columns.
+# The demo login keeps the sample resident_id (R001...).
 
 # ---- File paths (the only place they are written) ----------------------------
 PATH_SURVEY <- "data/fake_survey.csv"
@@ -32,6 +43,67 @@ GENDERS <- c("Female", "Male")
 
 SURVEY_COLUMNS <- c("resident_id", "name", "block", "program",
                     "course", "blocked", "pref_days", "pref_band")
+
+# TODO: set to TRUE once the responses table has email, consent and
+# consent_at columns (Person 2, data_load.R) and write_responses() accepts them.
+SAVE_EXTRA_COLUMNS <- FALSE
+EXTRA_COLUMNS <- c("email", "consent", "consent_at")
+EMAIL_DOMAIN <- "mse.ac.in"
+
+CONSENT_LABEL <- "I have read and agree to the Terms of Use and the data policy."
+
+# Terms of Use, shown in a modal. Each section: title, optional intro, and
+# either bullets or a numbered list.
+TERMS <- list(
+  list(title = "1. How slots are allocated", bullets = c(
+    "The app tries to match your preferred days and times, but they are not guaranteed. The schedule is built from everyone's timetables, availability and preferences, so some requests can't be met.",
+    "Each resident gets up to 2 slots per 10-day cycle, with a gap of 4–5 days between them. A quick wash is 30 minutes and a normal wash is 60 minutes.",
+    "Access is by block: Block D for boys, Blocks A–C for girls.",
+    "A small share of slots is kept free for walk-ins. Extra slots are given only after everyone's two slots have been used.")),
+  list(title = "2. Your responsibilities", bullets = c(
+    "Give accurate lecture, blocked-time and preference details. Wrong details can make the schedule unsuitable for you.",
+    "Check in within 15 minutes of your slot's start. After that, the slot is released to others.",
+    "Use only your own slots. Don't swap or sell them.")),
+  list(title = "3. Cancelling or changing a slot", bullets = c(
+    "You can cancel or change a slot up to 6 hours before it starts.",
+    "You can do this 3 times in any 30 days. Changes and cancellations count together.",
+    "A cancelled slot is released and goes to the priority queue.")),
+  list(title = "4. Cancellation vs no-show", bullets = c(
+    "Cancellation: you tell the app at least 6 hours before your slot. It doesn't count against you and is not a no-show. It does use one of your 3 changes for the 30 days.",
+    "No-show: you don't check in within 15 minutes of your slot's start, or you cancel less than 6 hours before. It moves you further back in the queue (see section 5).",
+    "A resident can have at most 3 no-shows. After your 3rd no-show, your allowance for the following month is reduced by 2 slots.")),
+  list(title = "5. Priority Queue for free slots",
+       intro = "A slot can become free at short notice, a few hours before it starts or right at the start, for example because someone cancelled or didn't check in. It goes to the first person in the queue by this order. If two people are in the same group, whoever asked first goes first.",
+       numbered = c(
+    "You cancelled your slot and haven't had your 1st slot in this 10-day cycle.",
+    "You haven't had your 2nd slot in this cycle.",
+    "You had 1 no-show and haven't had your 1st slot.",
+    "You had 1 no-show and haven't had your 2nd slot.",
+    "You asked for an extra slot after using both of your slots.",
+    "You had 2 no-shows and haven't had your 1st slot.",
+    "You had 2 no-shows and haven't had your 2nd slot.",
+    "You had 3 no-shows and haven't had your 1st slot.",
+    "You had 3 no-shows and haven't had your 2nd slot.")),
+  list(title = "6. Walk-in (emergency) slots",
+       intro = "Some slots, usually at times when most residents are in class such as mornings, are kept free and not booked in advance. Use them for urgent washes. They are open to anyone in your block's allowed group."),
+  list(title = "7. Your data", bullets = c(
+    "We collect your name, block, course, blocked times and preferences only to build and evaluate the laundry schedule, as part of a statistics course project.",
+    "Only the project team and the course instructor can see it. It is not shared elsewhere, and results are reported in aggregate without identifying you.",
+    "Taking part is voluntary. You can ask for your answers to be removed at any time.")),
+  list(title = "8. Other", bullets = c(
+    "This is a pilot. The schedule may change if machines are unavailable or rules are updated, and the team will tell residents when that happens."))
+)
+
+terms_ui <- function() {
+  tagList(lapply(TERMS, function(sec) {
+    tagList(
+      h6(class = "mt-3", sec$title),
+      if (!is.null(sec$intro)) p(sec$intro),
+      if (!is.null(sec$bullets)) tags$ul(lapply(sec$bullets, tags$li)),
+      if (!is.null(sec$numbered)) tags$ol(lapply(sec$numbered, tags$li))
+    )
+  }))
+}
 
 # ---- Fallbacks, used only if a file above fails to load ----------------------
 FALLBACK_DAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -221,16 +293,25 @@ test_blocked_helpers <- function() {
   invisible(TRUE)
 }
 
-# One-row survey-format data.frame built from form values.
+# One-row survey-format data.frame built from form values. With `email` given
+# (SAVE_EXTRA_COLUMNS) the columns email, consent and consent_at are appended.
 build_response_row <- function(resident_id, name, block, program, course,
                                blocked, pref_days, pref_band = "",
-                               days = FALLBACK_DAYS) {
-  data.frame(resident_id = resident_id, name = name, block = block,
-             program = program, course = course,
-             blocked = format_windows(blocked, days),
-             pref_days = paste(pref_days, collapse = ";"),
-             pref_band = if (is.null(pref_band)) "" else pref_band,
-             stringsAsFactors = FALSE)[, SURVEY_COLUMNS]
+                               days = FALLBACK_DAYS, email = NULL,
+                               consent_at = NULL) {
+  row <- data.frame(resident_id = resident_id, name = name, block = block,
+                    program = program, course = course,
+                    blocked = format_windows(blocked, days),
+                    pref_days = paste(pref_days, collapse = ";"),
+                    pref_band = if (is.null(pref_band)) "" else pref_band,
+                    stringsAsFactors = FALSE)
+  if (!is.null(email)) {
+    row$email <- email
+    row$consent <- 1L
+    row$consent_at <- if (is.null(consent_at)) "" else consent_at
+    return(row[, c(SURVEY_COLUMNS, EXTRA_COLUMNS)])
+  }
+  row[, SURVEY_COLUMNS]
 }
 
 test_response_row <- function() {
@@ -259,13 +340,77 @@ save_response <- function(con, row) {
 }
 
 # The resident's saved row from the database (survey format), or NULL if they
-# have none or there is no database.
-saved_response <- function(con, resident_id) {
+# have none or there is no database. `key` is the resident_id, or the email
+# when the responses have an email column.
+saved_response <- function(con, key) {
   if (is.null(con)) return(NULL)
   rows <- tryCatch(read_responses(con), error = function(e) NULL)
   if (is.null(rows)) return(NULL)
-  row <- rows[rows$resident_id == resident_id, , drop = FALSE]
+  hit <- if ("email" %in% names(rows)) rows$email == key else FALSE
+  row <- rows[rows$resident_id == key | hit, , drop = FALSE]
   if (nrow(row) == 0) NULL else row
+}
+
+# ---- Email and resident id ---------------------------------------------------
+
+normalize_email <- function(x) tolower(trimws(x))
+
+# Format check only: one address ending in @mse.ac.in, any case. Spaces around
+# the address are ignored; spaces inside it are not allowed.
+is_valid_email <- function(x) {
+  if (length(x) != 1 || is.na(x)) return(FALSE)
+  grepl(paste0("^[^@[:space:]]+@", gsub(".", "\\.", EMAIL_DOMAIN, fixed = TRUE), "$"),
+        normalize_email(x))
+}
+
+# "R_" + block + 2-digit number: the highest existing number for that block
+# + 1 (not a row count, so deleted rows never cause a clash).
+next_resident_id <- function(block, existing_ids) {
+  m <- regmatches(existing_ids,
+                  regexec(paste0("^R_", block, "([0-9]+)$"), existing_ids))
+  nums <- suppressWarnings(as.integer(vapply(m, function(v) {
+    if (length(v) == 2) v[2] else NA_character_
+  }, "")))
+  sprintf("R_%s%02d", block, max(c(0L, nums), na.rm = TRUE) + 1L)
+}
+
+# The resident_id to save. Until the email column exists the lowercased email
+# is the id. After that an email already in `rows` keeps its id; a new one gets
+# the next id for the block. `rows` is read_responses() (or NULL).
+resolve_resident_id <- function(email, block, rows, extra = SAVE_EXTRA_COLUMNS) {
+  email <- normalize_email(email)
+  if (!extra) return(email)
+  if (is.data.frame(rows) && "email" %in% names(rows)) {
+    hit <- rows$resident_id[!is.na(rows$email) & rows$email == email]
+    if (length(hit) > 0) return(hit[1])
+  }
+  next_resident_id(block, if (is.data.frame(rows)) rows$resident_id else character())
+}
+
+test_email_and_id <- function() {
+  ok <- c("aisha.bagga@mse.ac.in", "A.Bagga@MSE.AC.IN", "  a@mse.ac.in  ")
+  bad <- c("a@gmail.com", "a@mse.ac.in.evil.com", "a@xmse.ac.in", "a b@mse.ac.in",
+           "a@ mse.ac.in", "@mse.ac.in", "a@@mse.ac.in", "a@mse.ac.in;b@mse.ac.in",
+           "", "   ", NA, "mse.ac.in", "a")
+  stopifnot(all(vapply(ok, is_valid_email, NA)))
+  stopifnot(!any(vapply(bad, is_valid_email, NA)))
+  stopifnot(normalize_email("  A.Bagga@MSE.ac.in ") == "a.bagga@mse.ac.in")
+  # generated ids: highest number + 1 per block, not a row count
+  stopifnot(next_resident_id("C", c("R_C01", "R_C03", "R_A07", "R001", "x")) == "R_C04")
+  stopifnot(next_resident_id("D", c("R_C01")) == "R_D01")
+  stopifnot(next_resident_id("A", character()) == "R_A01")
+  stopifnot(next_resident_id("B", c("R_B09")) == "R_B10",
+            next_resident_id("B", c("R_B99")) == "R_B100")
+  stopifnot(next_resident_id("C", c("R_C01", "R_CC02", "R_C1x")) == "R_C02")
+  # until the columns exist the email is the id
+  stopifnot(resolve_resident_id("A@Mse.ac.in", "C", NULL, FALSE) == "a@mse.ac.in")
+  # with the columns: first save generates, later saves keep the id
+  rows <- data.frame(resident_id = c("R_C01", "R_C02"),
+                     email = c("x@mse.ac.in", "y@mse.ac.in"))
+  stopifnot(resolve_resident_id("z@mse.ac.in", "C", rows, TRUE) == "R_C03")
+  stopifnot(resolve_resident_id("Y@mse.ac.in", "A", rows, TRUE) == "R_C02")  # block changed
+  stopifnot(resolve_resident_id("z@mse.ac.in", "D", NULL, TRUE) == "R_D01")
+  invisible(TRUE)
 }
 
 resident_choices <- function(residents) {
@@ -306,6 +451,46 @@ time_choices <- function(from = "00:00", to = "24:00", step = 30) {
   min_to_hhmm(seq(hhmm_to_min(from), hhmm_to_min(to), by = step))
 }
 
+# Server-level checks: the terms block submit, the demo login saves a valid
+# row, and the email login saves under the lowercased email. Needs shiny,
+# bslib, DBI and RSQLite, and R/data_load.R, sourced first.
+test_save_flow <- function() {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  db_init(con)
+  form <- list(name = "Test Person", gender = "Female", block = "B",
+               course = "DS", program = "quick", pref_band = "", pref_days = "Sat")
+  shiny::testServer(mod_questionnaire_server, args = list(con = con), {
+    # not signed in
+    do.call(session$setInputs, c(form, list(terms = TRUE, save = 1)))
+    stopifnot(is.null(last_response()), nrow(read_responses(con)) == 0)
+    # bad email: not signed in, message shown
+    session$setInputs(email = "someone@gmail.com", email_go = 1)
+    stopifnot(is.null(current_user()), grepl("mse.ac.in", output$email_msg$html))
+    # good email (any case, spaces around)
+    session$setInputs(email = "  Test.Person@MSE.AC.IN ", email_go = 2)
+    stopifnot(identical(current_user(), "test.person@mse.ac.in"))
+    # terms not ticked: submit is refused and nothing is saved
+    session$setInputs(terms = FALSE, save = 2)
+    stopifnot(is.null(last_response()), nrow(read_responses(con)) == 0,
+              grepl("Terms of Use", output$save_result$html))
+    # ticked: saved under the lowercased email (SAVE_EXTRA_COLUMNS is FALSE)
+    session$setInputs(terms = TRUE, save = 3)
+    r <- read_responses(con)
+    stopifnot(nrow(r) == 1, r$resident_id == "test.person@mse.ac.in",
+              identical(names(r), SURVEY_COLUMNS))
+    # demo login: a sample resident still saves a valid survey-format row
+    session$setInputs(demo = TRUE, user = "R001", login = 1)
+    do.call(session$setInputs, modifyList(form, list(name = "", block = "A", terms = TRUE, save = 4)))
+    r <- read_responses(con)
+    stopifnot(nrow(r) == 2, "R001" %in% r$resident_id,
+              identical(names(r), SURVEY_COLUMNS),
+              r$name[r$resident_id == "R001"] == residents$name[residents$resident_id == "R001"],
+              r$block[r$resident_id == "R001"] == "A")
+  })
+  invisible(TRUE)
+}
+
 # ---- Module ------------------------------------------------------------------
 
 mod_questionnaire_ui <- function(id) {
@@ -317,56 +502,79 @@ mod_questionnaire_ui <- function(id) {
   times <- time_choices()
   div(
     class = "p-2",
+    tags$style(HTML("
+      .q-days .shiny-options-group { display: flex; flex-wrap: wrap; gap: .25rem 1.25rem; }
+      .q-days .form-check-inline, .q-days .checkbox-inline { margin: 0; }
+      .q-days.shiny-input-container { margin-bottom: .5rem; width: auto; }
+    ")),
     layout_columns(
       fill = FALSE, col_widths = c(12, 12),
       card(
         fill = FALSE,
-        card_header("Log in (demo)"),
-        div(class = "d-flex flex-wrap gap-3 align-items-end",
-            selectInput(ns("user"), "Sample resident",
-                        choices = resident_choices(q_residents()),
-                        selectize = FALSE, width = "16rem"),
-            div(class = "mb-3", actionButton(ns("login"), "Log in"))),
+        card_header("Sign in"),
+        div(class = "d-flex flex-wrap gap-3 align-items-start",
+            textInput(ns("email"), "Your @mse.ac.in email",
+                      placeholder = paste0("name@", EMAIL_DOMAIN), width = "20rem"),
+            div(style = "margin-top: 32px;",
+                actionButton(ns("email_go"), "Continue"))),
+        uiOutput(ns("email_msg")),
+        checkboxInput(ns("demo"), "Demo login (testing only)", value = FALSE),
+        conditionalPanel(
+          "input.demo", ns = ns,
+          div(class = "d-flex flex-wrap gap-3 align-items-end",
+              selectInput(ns("user"), "Sample resident",
+                          choices = resident_choices(q_residents()),
+                          selectize = FALSE, width = "16rem"),
+              div(class = "mb-3", actionButton(ns("login"), "Use sample resident")))),
         textOutput(ns("who"))
       ),
-      card(
-        fill = FALSE,
-        card_header("Questionnaire"),
-        div(class = "d-flex flex-wrap gap-3",
-            selectInput(ns("gender"), "Gender", choices = GENDERS,
-                        selectize = FALSE, width = "8rem"),
-            selectInput(ns("block"), "Block",
-                        choices = blocks_for_gender(GENDERS[1], cfg$blocks),
-                        selectize = FALSE, width = "8rem"),
-            selectInput(ns("course"), "Course", choices = q_courses(),
-                        selectize = FALSE, width = "10rem"),
-            selectInput(ns("program"), "Program", choices = prog_labels,
-                        selectize = FALSE, width = "12rem"),
-            selectInput(ns("pref_band"), "Preferred time band (optional)",
-                        choices = c("No preference" = "", cfg$bands),
-                        selectize = FALSE, width = "14rem")),
-        checkboxGroupInput(ns("pref_days"), "Preferred days (optional)",
-                           choices = cfg$days, inline = TRUE),
-        tags$hr(),
-        h6("Blocked times (when you are definitely unavailable, including sleep)"),
-        p(class = "text-muted small mb-2",
-          "A window can run past midnight: choose a 'To' earlier than 'From'."),
-        div(class = "d-flex flex-wrap gap-3 align-items-end",
-            selectInput(ns("b_day"), "Day", choices = cfg$days,
-                        selectize = FALSE, width = "7rem"),
-            selectInput(ns("b_start"), "From", choices = times[-length(times)],
-                        selected = "09:00", selectize = FALSE, width = "7rem"),
-            selectInput(ns("b_end"), "To", choices = times[-1],
-                        selected = "17:00", selectize = FALSE, width = "7rem"),
-            div(class = "mb-3", actionButton(ns("b_add"), "Add window")),
-            div(class = "mb-3",
-                actionButton(ns("b_sleep"), "Add sleep 23:00-07:00 to every day",
-                             class = "btn-outline-secondary"))),
-        uiOutput(ns("b_list")),
-        uiOutput(ns("b_warning")),
-        tags$hr(),
-        actionButton(ns("save"), "Save response", class = "btn-primary"),
-        uiOutput(ns("save_result"))
+      conditionalPanel(
+        "output.signed_in", ns = ns,
+        card(
+          fill = FALSE,
+          card_header("Questionnaire"),
+          div(class = "d-flex flex-wrap gap-3 align-items-start",
+              textInput(ns("name"), "Name", width = "12rem"),
+              selectInput(ns("gender"), "Gender", choices = GENDERS,
+                          selectize = FALSE, width = "8rem"),
+              selectInput(ns("block"), "Block",
+                          choices = blocks_for_gender(GENDERS[1], cfg$blocks),
+                          selectize = FALSE, width = "8rem"),
+              selectInput(ns("course"), "Course", choices = q_courses(),
+                          selectize = FALSE, width = "10rem"),
+              selectInput(ns("program"), "Program", choices = prog_labels,
+                          selectize = FALSE, width = "11rem"),
+              selectInput(ns("pref_band"), "Time band (optional)",
+                          choices = c("No preference" = "", cfg$bands),
+                          selectize = FALSE, width = "12rem")),
+          div(class = "q-days",
+              checkboxGroupInput(ns("pref_days"), "Preferred days (optional)",
+                                 choices = cfg$days, inline = TRUE)),
+          tags$hr(class = "my-2"),
+          h6("Blocked times (when you are definitely unavailable, including sleep)"),
+          p(class = "text-muted small mb-2",
+            "A window can run past midnight: choose a 'To' earlier than 'From'."),
+          div(class = "d-flex flex-wrap gap-3 align-items-end",
+              selectInput(ns("b_day"), "Day", choices = cfg$days,
+                          selectize = FALSE, width = "7rem"),
+              selectInput(ns("b_start"), "From", choices = times[-length(times)],
+                          selected = "09:00", selectize = FALSE, width = "7rem"),
+              selectInput(ns("b_end"), "To", choices = times[-1],
+                          selected = "17:00", selectize = FALSE, width = "7rem"),
+              div(class = "mb-3", actionButton(ns("b_add"), "Add window")),
+              div(class = "mb-3",
+                  actionButton(ns("b_sleep"), "Add sleep 23:00-07:00 to every day",
+                               class = "btn-outline-secondary"))),
+          uiOutput(ns("b_list")),
+          uiOutput(ns("b_warning")),
+          tags$hr(class = "my-2"),
+          div(class = "d-flex flex-wrap column-gap-3 align-items-baseline",
+              checkboxInput(ns("terms"), CONSENT_LABEL, value = FALSE, width = "auto"),
+              actionLink(ns("show_terms"), "Read the Terms of Use")),
+          actionButton(ns("save"), "Save response", class = "btn-primary",
+                       disabled = NA),
+          uiOutput(ns("save_result"))
+        )
       )
     )
   )
@@ -376,23 +584,27 @@ mod_questionnaire_server <- function(id, con = NULL) {
   moduleServer(id, function(input, output, session) {
     cfg <- q_config()
     residents <- q_residents()
-    current_user <- reactiveVal(NULL)
+    current_user <- reactiveVal(NULL)  # normalised email, or sample resident_id
+    login_kind <- reactiveVal(NULL)    # "email" or "demo"
     blocked <- reactiveVal(empty_windows())
     last_response <- reactiveVal(NULL)
     save_msg <- reactiveVal(NULL)
-    prefill_from <- reactiveVal("sample")
+    email_msg <- reactiveVal(NULL)
+    prefill_from <- reactiveVal("none")
+
+    output$signed_in <- reactive(!is.null(current_user()))
+    outputOptions(output, "signed_in", suspendWhenHidden = FALSE)
 
     user_row <- reactive({
-      req(current_user())
+      req(identical(login_kind(), "demo"))
       residents[residents$resident_id == current_user(), , drop = FALSE]
     })
 
     output$who <- renderText({
-      if (is.null(current_user())) "Not logged in."
-      else paste0("Logged in as ", current_user(), " - ", user_row()$name,
-                  if (prefill_from() == "saved") {
-                    ". Form filled from your saved response."
-                  } else ".")
+      if (is.null(current_user())) return("Not signed in.")
+      paste0("Signed in as ", current_user(),
+             if (identical(login_kind(), "demo")) " (demo login)", ".",
+             if (prefill_from() == "saved") " Form filled from your saved response.")
     })
 
     get_col <- function(row, col, default = "") {
@@ -407,17 +619,12 @@ mod_questionnaire_server <- function(id, con = NULL) {
                         selected = if (keep %in% choices) keep else choices[1])
     })
 
-    observeEvent(input$login, {
-      current_user(input$user)
-      save_msg(NULL)
-      r <- saved_response(con, input$user)
-      prefill_from(if (is.null(r)) "sample" else "saved")
-      if (is.null(r)) {
-        r <- residents[residents$resident_id == input$user, , drop = FALSE]
-      }
+    # Fills the form from a one-row survey-format data.frame.
+    fill_form <- function(r) {
+      updateTextInput(session, "name", value = get_col(r, "name"))
       block <- get_col(r, "block")
       if (block %in% cfg$blocks && !is.na(gender_for_block(block))) {
-        gender <- gender_for_block(block)  # sample residents: gender from block
+        gender <- gender_for_block(block)  # gender is derived from the block
         updateSelectInput(session, "gender", selected = gender)
         updateSelectInput(session, "block",
                           choices = blocks_for_gender(gender, cfg$blocks),
@@ -434,6 +641,48 @@ mod_questionnaire_server <- function(id, con = NULL) {
       pd <- strsplit(get_col(r, "pref_days"), ";", fixed = TRUE)[[1]]
       updateCheckboxGroupInput(session, "pref_days", selected = pd)
       blocked(parse_windows(get_col(r, "blocked")))
+    }
+
+    observeEvent(input$email_go, {
+      if (!is_valid_email(input$email)) {
+        email_msg(div(class = "text-danger small mb-2",
+                      paste0("Please use your ", EMAIL_DOMAIN, " email address, ",
+                             "for example name@", EMAIL_DOMAIN, ".")))
+        return()
+      }
+      email_msg(NULL)
+      save_msg(NULL)
+      key <- normalize_email(input$email)
+      current_user(key)
+      login_kind("email")
+      r <- saved_response(con, key)
+      prefill_from(if (is.null(r)) "none" else "saved")
+      if (!is.null(r)) fill_form(r)
+    })
+    output$email_msg <- renderUI(email_msg())
+
+    # Demo login (testing only): a sample resident from the fake survey.
+    observeEvent(input$login, {
+      current_user(input$user)
+      login_kind("demo")
+      email_msg(NULL)
+      save_msg(NULL)
+      r <- saved_response(con, input$user)
+      prefill_from(if (is.null(r)) "sample" else "saved")
+      if (is.null(r)) {
+        r <- residents[residents$resident_id == input$user, , drop = FALSE]
+      }
+      fill_form(r)
+    })
+
+    observeEvent(input$show_terms, {
+      showModal(modalDialog(title = "Terms of Use", terms_ui(), size = "l",
+                            easyClose = TRUE, footer = modalButton("Close")))
+    })
+
+    # Save is only enabled once the terms are ticked.
+    observe({
+      shiny::updateActionButton(session, "save", disabled = !isTRUE(input$terms))
     })
 
     observeEvent(input$b_add, {
@@ -476,23 +725,38 @@ mod_questionnaire_server <- function(id, con = NULL) {
     })
 
     observeEvent(input$save, {
-      if (is.null(current_user())) {
-        showNotification("Please log in first.", type = "error")
-        return()
-      }
-      if (!block_allowed(input$gender, input$block)) {
-        msg <- paste0("Block ", input$block, " is not available for ",
-                      input$gender, ". ", input$gender, " residents can choose ",
-                      "block ", paste(blocks_for_gender(input$gender), collapse = ", "),
-                      ".")
+      refuse <- function(msg) {
         save_msg(div(class = "alert alert-danger mt-2", msg))
         showNotification(msg, type = "error")
-        return()
       }
-      row <- build_response_row(current_user(), user_row()$name, input$block,
-                                input$program, input$course,
-                                blocked(), input$pref_days, input$pref_band,
-                                cfg$days)
+      if (is.null(current_user())) {
+        return(refuse(paste0("Please enter your ", EMAIL_DOMAIN,
+                             " email and press Continue first.")))
+      }
+      if (!isTRUE(input$terms)) {
+        return(refuse(paste("You must agree to the Terms of Use and the data",
+                            "policy before submitting.")))
+      }
+      demo <- identical(login_kind(), "demo")
+      name <- trimws(input$name)
+      if (!nzchar(name) && demo) name <- user_row()$name
+      if (!nzchar(name)) return(refuse("Please enter your name."))
+      if (!block_allowed(input$gender, input$block)) {
+        return(refuse(paste0(
+          "Block ", input$block, " is not available for ", input$gender, ". ",
+          input$gender, " residents can choose block ",
+          paste(blocks_for_gender(input$gender), collapse = ", "), ".")))
+      }
+
+      resident_id <- if (demo) current_user() else {
+        resolve_resident_id(current_user(), input$block,
+                            tryCatch(read_responses(con), error = function(e) NULL))
+      }
+      row <- build_response_row(
+        resident_id, name, input$block, input$program, input$course, blocked(),
+        input$pref_days, input$pref_band, cfg$days,
+        email = if (SAVE_EXTRA_COLUMNS) { if (demo) "" else current_user() },
+        consent_at = if (SAVE_EXTRA_COLUMNS) format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
       res <- tryCatch(save_response(con, row), error = function(e) e)
       if (inherits(res, "error")) {
         save_msg(div(class = "alert alert-danger mt-2",
