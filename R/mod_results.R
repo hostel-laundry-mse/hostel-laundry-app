@@ -28,7 +28,8 @@
 #   (from slot start to checkin_grace_min after); "Can't make it" (move to
 #   another slot up to change_cutoff_hours before, or release it any time
 #   before it starts; both count towards max_changes per changes_window_days);
-#   changes left and no-shows; join or leave the extra-slot queue.
+#   "Finished" after checking in (check_out()); changes left and no-shows;
+#   join or leave the extra-slot queue.
 # Schedule ("all"): every machine by date, coloured by status, and the
 #   "Free now" list of released slots anyone eligible can claim.
 #
@@ -69,7 +70,8 @@ RES_DEFAULTS <- list(checkin_grace_min = 15, change_cutoff_hours = 6,
                      queue_min_lead_min = 60, reserve_share = 0,
                      buffer_min = 10, grid_min = 30, cycle_days = 10,
                      slots_per_cycle = 2)
-RES_ACTIVE <- c("booked", "checked_in")       # statuses that hold the machine
+RES_ACTIVE <- c("booked", "checked_in", "finished")  # hold the machine / count as a booking
+RES_USED   <- c("checked_in", "finished")            # the resident actually washed
 RES_FREED  <- c("released", "moved")          # statuses that free it again
 
 res_path <- function(name, fallback) {
@@ -399,8 +401,28 @@ res_check_in <- function(ctx, booking_id, person) {
   if (nrow(bk) != 1) return(list(ok = FALSE, msg = "Booking not found."))
   st <- res_checkin_status(bk, ctx$now, ctx$s)
   if (!st$ok) return(list(ok = FALSE, msg = st$why))
-  set_booking_status(ctx$con, booking_id, "checked_in")
+  # Person 2's check_in() also records the time; fall back if it isn't there.
+  if (exists("check_in", mode = "function")) {
+    r <- tryCatch(check_in(ctx$con, booking_id, at = ctx$now, config = ctx$config),
+                  error = function(e) e)
+    if (inherits(r, "error")) return(list(ok = FALSE, msg = conditionMessage(r)))
+  } else {
+    set_booking_status(ctx$con, booking_id, "checked_in")
+  }
   list(ok = TRUE, msg = "Checked in. Happy washing!")
+}
+
+# "Finished": Person 2's check_out() marks the wash finished (needs R/data_load.R
+# with check_out(); the button is hidden without it).
+res_can_check_out <- function() exists("check_out", mode = "function")
+res_check_out <- function(ctx, booking_id, person) {
+  bk <- res_my_booking(ctx, booking_id, person)
+  if (nrow(bk) != 1) return(list(ok = FALSE, msg = "Booking not found."))
+  if (bk$status != "checked_in") return(list(ok = FALSE, msg = "Check in first."))
+  if (!res_can_check_out()) return(list(ok = FALSE, msg = "Not available yet."))
+  r <- tryCatch(check_out(ctx$con, booking_id, at = ctx$now), error = function(e) e)
+  if (inherits(r, "error")) return(list(ok = FALSE, msg = conditionMessage(r)))
+  list(ok = TRUE, msg = "Marked as finished. Thanks for freeing the machine!")
 }
 
 # Freed machine time goes to the first eligible person in the queue.
@@ -504,7 +526,7 @@ res_queue_status <- function(ctx, person) {
     return(list(state = "waiting", position = which(same$person == person)))
   }
   held <- sum(cyc$status %in% c(RES_ACTIVE, "no_show"))
-  used <- sum(cyc$status == "checked_in")
+  used <- sum(cyc$status %in% RES_USED)
   if (held < ctx$s$slots_per_cycle || used >= ctx$s$slots_per_cycle) {
     return(list(state = "can_join"))
   }
@@ -537,9 +559,11 @@ res_leave_queue <- function(ctx, person) {
 # ---- UI ----------------------------------------------------------------------
 
 RES_STATUS_LABEL <- c(booked = "Booked", checked_in = "Checked in",
-                      no_show = "No-show", released = "Free", moved = "Free")
+                      finished = "Finished", no_show = "No-show",
+                      released = "Free", moved = "Free")
 RES_STATUS_COLOUR <- c(booked = "#2c7fb8", checked_in = "#198754",
-                       no_show = "#dc3545", released = "#adb5bd", moved = "#adb5bd")
+                       finished = "#6f42c1", no_show = "#dc3545",
+                       released = "#adb5bd", moved = "#adb5bd")
 
 res_css <- tags$style(HTML("
   .res-card { border:1px solid var(--bs-border-color,#dee2e6); border-radius:8px;
@@ -719,6 +743,10 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
               act("Started", "checkin", bk$booking_id, ci$ok, "btn-success"),
               act("Can't make it", "cant", bk$booking_id, ch$ok),
               span(class = "res-hint", if (ci$ok) ci$why else if (ch$why != "") ch$why else ci$why)
+            ),
+            if (bk$status == "checked_in" && res_can_check_out()) tagList(
+              act("Finished", "checkout", bk$booking_id, TRUE, "btn-primary"),
+              span(class = "res-hint", "Tap when your wash is done")
             ))
       })
     })
@@ -774,6 +802,7 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
       a <- input$action; x <- ctx(); p <- me()
       switch(a$type,
         checkin     = done(res_check_in(x, a$id, p)),
+        checkout    = done(res_check_out(x, a$id, p)),
         cant        = open_dialog(a$id),
         claim       = done(res_claim(x, a$id, p)),
         join_queue  = done(res_join_queue(x, p)),
@@ -838,8 +867,8 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
       s$who <- ifelse(s$person == p, "You", s$person)
       s$who[s$status %in% RES_FREED] <- "free"
       s$state <- factor(RES_STATUS_LABEL[s$status], levels = unique(RES_STATUS_LABEL))
-      cols <- setNames(RES_STATUS_COLOUR[c("booked", "checked_in", "no_show", "released")],
-                       unique(RES_STATUS_LABEL))
+      cols <- setNames(RES_STATUS_COLOUR[c("booked", "checked_in", "finished", "no_show",
+                                           "released")], unique(RES_STATUS_LABEL))
       lo <- x$s$open; hi <- x$s$close
       ggplot(s) +
         geom_rect(aes(xmin = x - 0.42, xmax = x + 0.42, ymin = -y1, ymax = -y0, fill = state),

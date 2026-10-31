@@ -53,6 +53,18 @@ check("someone else can't check in for R001", !res_check_in(x, id, "R002")$ok)
 check("R001 checks in", res_check_in(x, id, "R001")$ok && status_of(con, id) == "checked_in")
 x <- ctx_at(con, "2026-11-03", "10:16")
 check("checking in twice refused", !res_check_in(x, id, "R001")$ok)
+if (exists("check_in", mode = "function")) {
+  check("check-in time recorded (Person 2's check_in)",
+        !is.na(read_bookings(con)$checked_in_at[read_bookings(con)$booking_id == id]))
+}
+if (res_can_check_out()) {
+  x <- ctx_at(con, "2026-11-03", "10:35")
+  check("someone else can't mark R001's wash finished", !res_check_out(x, id, "R002")$ok)
+  check("R001 taps Finished", res_check_out(x, id, "R001")$ok && status_of(con, id) == "finished")
+  check("finished wash still counts as R001's booking that day",
+        res_why_not("R001", "A-2", "2026-11-03", "15:00", x$active, x$survey, x$fw, x$s) ==
+          "You already have a wash that day")
+}
 
 # ---- 3. no-shows ----------------------------------------------------------------
 id2 <- bid(con, "R002", "2026-11-03")           # 11:00-12:00
@@ -60,7 +72,7 @@ x <- ctx_at(con, "2026-11-03", "11:15")
 check("not a no-show at start+15", status_of(con, id2) == "booked")
 x <- ctx_at(con, "2026-11-03", "11:16")
 check("no-show at start+16", status_of(con, id2) == "no_show")
-check("checked-in slot is not a no-show", status_of(con, id) == "checked_in")
+check("checked-in (or finished) slot is not a no-show", status_of(con, id) %in% c("checked_in", "finished"))
 check("no-show counted", res_no_shows(x$bookings, "R002") == 1)
 dbDisconnect(con)
 
@@ -141,6 +153,7 @@ x <- ctx_at(con, "2026-11-02", "08:00")
 check("R008 holding 2 unused slots can't join yet", res_queue_status(x, "R008")$state == "not_yet")
 check("joining refused", !res_join_queue(x, "R008")$ok)
 for (d in c("2026-11-04", "2026-11-09")) set_booking_status(con, bid(con, "R008", d), "checked_in")
+if (res_can_check_out()) check_out(con, bid(con, "R008", "2026-11-09"), at = at("2026-11-09", "13:40"))
 x <- ctx_at(con, "2026-11-02", "08:00")
 check("R008 after using both can join", res_join_queue(x, "R008")$ok)
 check("R008 waiting, number 1", res_queue_status(ctx_at(con, "2026-11-02", "08:01"), "R008")$position == 1)
