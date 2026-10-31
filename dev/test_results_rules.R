@@ -66,6 +66,26 @@ if (res_can_check_out()) {
           "You already have a wash that day")
 }
 
+# ---- 2b. star rating after a finished wash -------------------------------------
+if (res_can_rate() && res_can_check_out()) {
+  x <- ctx_at(con, "2026-11-03", "10:40")
+  later <- bid(con, "R001", "2026-11-07")
+  check("a wash that isn't finished can't be rated", !res_rate(x, later, "R001", 5)$ok)
+  check("someone else can't rate R001's wash", !res_rate(x, id, "R002", 5)$ok)
+  check("0 stars refused", !res_rate(x, id, "R001", 0)$ok)
+  check("6 stars refused", !res_rate(x, id, "R001", 6)$ok)
+  check("R001 rates 4 stars with a comment", res_rate(x, id, "R001", 4, "Machine was clean")$ok)
+  fb <- read_feedback(con)
+  check("feedback saved: booking, person, rating, comment",
+        nrow(fb) == 1 && fb$booking_id == id && fb$person == "R001" && fb$rating == 4 &&
+        fb$comment == "Machine was clean")
+  x <- ctx_at(con, "2026-11-03", "10:41")
+  check("rating twice refused", !res_rate(x, id, "R001", 2)$ok && nrow(read_feedback(con)) == 1)
+  check("page sees the rating", nrow(res_feedback_for(x, id)) == 1)
+  check("stars drawn as 4 filled + 1 empty",
+        grepl("(&#9733;){4}</span>.*&#9734;</span>", as.character(res_stars(4))))
+}
+
 # ---- 3. no-shows ----------------------------------------------------------------
 id2 <- bid(con, "R002", "2026-11-03")           # 11:00-12:00
 x <- ctx_at(con, "2026-11-03", "11:15")
@@ -178,8 +198,18 @@ x <- ctx_at(con, "2026-11-02", "10:01")
 check("queue order: R009 (holds 1) ahead of R007 (holds 2, asked earlier)",
       res_queue_status(x, "R009")$position == 1 && res_queue_status(x, "R007")$position == 2)
 q <- read_queue(con, "waiting")
-pk <- res_pick_from_queue(data.frame(machine = "C-1", date = "2026-11-04", start = "14:00"),
-                          q, x$active, x$survey, x$fw, x$s, x$cycle_start, x$now)
+# a C-1 slot both R009 and R007 can take (found from their real free time)
+both <- NULL
+for (d in format(as.Date("2026-11-03") + 0:7)) for (m in seq(x$s$open, x$s$close - 90, 30)) {
+  st <- res_hhmm(m)
+  if (res_why_not("R009", "C-1", d, st, x$active, x$survey, x$fw, x$s) == "" &&
+      res_why_not("R007", "C-1", d, st, x$active, x$survey, x$fw, x$s) == "") {
+    both <- data.frame(machine = "C-1", date = d, start = st); break
+  }
+  if (!is.null(both)) break
+}
+check("found a slot both R009 and R007 are free for", !is.null(both))
+pk <- res_pick_from_queue(both, q, x$active, x$survey, x$fw, x$s, x$cycle_start, x$now)
 check("stand-in picker chooses R009 first", identical(pk$person, "R009"))
 check("blocked time respected: R009 not eligible Fri 06 Nov 09:00 (blocked Fri 07-12)",
       res_why_not("R009", "C-1", "2026-11-06", "09:00", x$active, x$survey, x$fw, x$s) == "Not in your free time")
@@ -237,6 +267,19 @@ testServer(mod_results_server, args = list(schedule = sch, view = "mine", con = 
   i1 <- bid(con, "R001", "2026-11-03")
   session$setInputs(action = list(type = "checkin", id = i1, nonce = 1))
   check("tapping Started checks in", grepl("Checked in", output$cards$html))
+  if (res_can_check_out() && res_can_rate()) {
+    check("Finished button shows after check-in", grepl(">Finished<", output$cards$html))
+    session$setInputs(action = list(type = "checkout", id = i1, nonce = 11))
+    check("tapping Finished marks the wash finished", status_of(con, i1) == "finished")
+    check("...and the star rating pops up straight away", identical(rating_for(), i1))
+    session$setInputs(do_rate = 1)
+    check("Submit without stars does nothing", nrow(read_feedback(con)) == 0)
+    session$setInputs(stars = "5", comment = "Quick and easy", do_rate = 2)
+    check("submitting 5 stars saves the rating",
+          nrow(read_feedback(con)) == 1 && read_feedback(con)$rating == 5)
+    check("card shows 'You rated 5/5' and the comment",
+          grepl("You rated 5/5", output$cards$html) && grepl("Quick and easy", output$cards$html))
+  }
   i2 <- bid(con, "R001", "2026-11-07")
   session$setInputs(action = list(type = "cant", id = i2, nonce = 2))
   check("Can't make it offers alternatives", is.data.frame(options()) && nrow(options()) > 0)

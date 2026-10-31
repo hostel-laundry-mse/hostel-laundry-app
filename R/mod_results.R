@@ -28,8 +28,9 @@
 #   (from slot start to checkin_grace_min after); "Can't make it" (move to
 #   another slot up to change_cutoff_hours before, or release it any time
 #   before it starts; both count towards max_changes per changes_window_days);
-#   "Finished" after checking in (check_out()); changes left and no-shows;
-#   join or leave the extra-slot queue.
+#   "Finished" after checking in (check_out()); then a 1-5 star rating with an
+#   optional comment (add_feedback()), which can be skipped and given later;
+#   changes left and no-shows; join or leave the extra-slot queue.
 # Schedule ("all"): every machine by date, coloured by status, and the
 #   "Free now" list of released slots anyone eligible can claim.
 #
@@ -383,7 +384,8 @@ res_context <- function(con, config, now, cycle_start = NULL, fw_cache = NULL) {
     if (!is.null(fw_cache)) { fw_cache$key <- key; fw_cache$fw <- fw }
   }
   list(con = con, config = config, s = s, now = now, cycle_start = cs,
-       bookings = b, active = b[b$status %in% RES_ACTIVE, ], survey = survey, fw = fw)
+       bookings = b, active = b[b$status %in% RES_ACTIVE, ], survey = survey, fw = fw,
+       feedback = res_read_feedback(con))
 }
 res_digest_survey <- function(survey) {
   if (is.null(survey)) return("none")
@@ -423,6 +425,43 @@ res_check_out <- function(ctx, booking_id, person) {
   r <- tryCatch(check_out(ctx$con, booking_id, at = ctx$now), error = function(e) e)
   if (inherits(r, "error")) return(list(ok = FALSE, msg = conditionMessage(r)))
   list(ok = TRUE, msg = "Marked as finished. Thanks for freeing the machine!")
+}
+
+# ---- Star rating after a wash (Person 2's add_feedback / read_feedback) ------
+
+res_can_rate <- function() {
+  exists("add_feedback", mode = "function") && exists("read_feedback", mode = "function")
+}
+res_read_feedback <- function(con) {
+  empty <- data.frame(feedback_id = integer(), booking_id = integer(), person = character(),
+                      rating = integer(), comment = character(), at = character())
+  if (!res_can_rate()) return(empty)
+  tryCatch(read_feedback(con), error = function(e) empty)
+}
+# The feedback row for a booking, or zero rows.
+res_feedback_for <- function(ctx, booking_id) {
+  ctx$feedback[ctx$feedback$booking_id == booking_id, , drop = FALSE]
+}
+# Five stars as HTML, the first n filled.
+res_stars <- function(n) {
+  n <- as.integer(n)
+  HTML(paste0('<span style="color:#f5a623;font-size:1.15em;letter-spacing:1px">',
+              strrep("&#9733;", n), "</span>",
+              '<span style="color:#ced4da;font-size:1.15em;letter-spacing:1px">',
+              strrep("&#9734;", 5 - n), "</span>"))
+}
+res_rate <- function(ctx, booking_id, person, rating, comment = NA) {
+  bk <- res_my_booking(ctx, booking_id, person)
+  if (nrow(bk) != 1) return(list(ok = FALSE, msg = "Booking not found."))
+  if (!res_can_rate()) return(list(ok = FALSE, msg = "Ratings are not available yet."))
+  if (bk$status != "finished") return(list(ok = FALSE, msg = "You can rate a wash once it's finished."))
+  if (nrow(res_feedback_for(ctx, booking_id)) > 0) {
+    return(list(ok = FALSE, msg = "You've already rated this wash."))
+  }
+  r <- tryCatch(add_feedback(ctx$con, booking_id, rating, comment, at = ctx$now),
+                error = function(e) e)
+  if (inherits(r, "error")) return(list(ok = FALSE, msg = conditionMessage(r)))
+  list(ok = TRUE, msg = "Thanks for your feedback!")
 }
 
 # Freed machine time goes to the first eligible person in the queue.
@@ -747,7 +786,19 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
             if (bk$status == "checked_in" && res_can_check_out()) tagList(
               act("Finished", "checkout", bk$booking_id, TRUE, "btn-primary"),
               span(class = "res-hint", "Tap when your wash is done")
-            ))
+            ),
+            if (bk$status == "finished" && res_can_rate()) {
+              fb <- res_feedback_for(x, bk$booking_id)
+              if (nrow(fb) > 0) {
+                div(style = "margin-top:6px", res_stars(fb$rating[1]),
+                    span(class = "res-hint", sprintf("You rated %d/5", as.integer(fb$rating[1]))),
+                    if (!is.na(fb$comment[1]) && nzchar(fb$comment[1]))
+                      div(class = "res-hint", style = "margin-left:0", em(HTML(paste0("&ldquo;", htmltools::htmlEscape(fb$comment[1]), "&rdquo;")))))
+              } else {
+                tagList(act("Rate this wash", "rate", bk$booking_id, TRUE, "btn-outline-warning"),
+                        span(class = "res-hint", "How was it? 1-5 stars"))
+              }
+            })
       })
     })
 
@@ -798,11 +849,45 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
         easyClose = TRUE))
     }
 
+    # ---- Star rating ----------------------------------------------------------
+    rating_for <- reactiveVal(NULL)
+    open_rating <- function(booking_id) {
+      x <- ctx(); bk <- res_my_booking(x, booking_id, me())
+      if (nrow(bk) != 1 || !res_can_rate()) return()
+      rating_for(booking_id)
+      showModal(modalDialog(
+        title = "How was your wash?",
+        p(sprintf("%s, %s-%s on machine %s", res_day(bk$date), bk$start, bk$end, bk$machine)),
+        radioButtons(ns("stars"), NULL, width = "100%", selected = character(0),
+                     choiceNames = lapply(1:5, function(n) span(res_stars(n), " ", n)),
+                     choiceValues = as.character(1:5)),
+        textAreaInput(ns("comment"), "Comment (optional)", width = "100%", rows = 3,
+                      placeholder = "Anything we should know? e.g. machine was dirty, waited for it"),
+        footer = tagList(modalButton("Skip"),
+                         actionButton(ns("do_rate"), "Submit", class = "btn-primary")),
+        easyClose = TRUE))
+    }
+    observeEvent(input$do_rate, {
+      if (is.null(input$stars) || !nzchar(input$stars)) {
+        showNotification("Pick 1 to 5 stars first.", type = "warning")
+        return()
+      }
+      req(rating_for())
+      removeModal()
+      done(res_rate(ctx(), rating_for(), me(), as.integer(input$stars), input$comment))
+      rating_for(NULL)
+    })
+
     observeEvent(input$action, {
       a <- input$action; x <- ctx(); p <- me()
       switch(a$type,
         checkin     = done(res_check_in(x, a$id, p)),
-        checkout    = done(res_check_out(x, a$id, p)),
+        checkout    = {
+          r <- res_check_out(x, a$id, p)
+          done(r)
+          if (isTRUE(r$ok)) open_rating(a$id)       # ask for stars straight away
+        },
+        rate        = open_rating(a$id),
         cant        = open_dialog(a$id),
         claim       = done(res_claim(x, a$id, p)),
         join_queue  = done(res_join_queue(x, p)),
