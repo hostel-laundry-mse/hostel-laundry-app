@@ -40,10 +40,64 @@
 #
 # db_init(con)
 #   Takes: con - connection from db_connect().
-#   Creates any missing table: bookings, changes, queue (see CLAUDE.md
-#   "Database tables") and responses (the columns save_response() in
-#   R/mod_questionnaire.R writes). Existing tables and rows are kept.
+#   Creates any missing table: bookings, changes, queue, residents, consents,
+#   feedback (see CLAUDE.md "Database tables") and responses (the columns
+#   save_response() in R/mod_questionnaire.R writes). An older bookings table
+#   is rebuilt to add checked_in_at, finished_at and status finished, keeping
+#   its rows and booking_ids. Existing tables and rows are kept.
 #   Returns: con, invisibly.
+#
+# load_participants(path)
+#   Takes: path to a CSV with columns resident_id, name, email, block.
+#   Returns: data.frame with those columns, emails in lower case. Stops unless
+#            every email ends in @mse.ac.in and IDs and emails are unique.
+# write_residents(con, df)
+#   Replaces the whole login list with df, checked as above: anyone left out
+#   can no longer log in. Their consents, bookings and feedback are kept.
+# read_residents(con)
+#   Returns: data.frame(resident_id, name, email, block).
+# find_resident_by_email(con, email)
+#   Returns: that person's row, any letter case, or zero rows if not listed.
+#
+# record_consent(con, resident_id, terms_version, at = Sys.time())
+#   Stops if the resident is not listed. Agreeing again to the same version
+#   keeps the first agreed_at.
+# has_consented(con, resident_id, terms_version)
+#   Returns: TRUE or FALSE for exactly that version.
+#
+# check_in(con, booking_id, at = Sys.time(), config = load_config())
+#   Booking must be booked and at within slot start to start +
+#   checkin_grace_min, both included (default 15). Sets status checked_in and
+#   checked_in_at. Times are this computer's local time. Stops otherwise.
+# check_out(con, booking_id, at = Sys.time())
+#   Booking must be checked_in, and at not before checked_in_at. Sets status
+#   finished and finished_at. Stops otherwise.
+#
+# add_feedback(con, booking_id, rating, comment = NA, at = Sys.time())
+#   Takes: rating - whole number 1 to 5; comment - optional text.
+#   Booking must be finished, and have no feedback yet. person comes from the
+#   booking. Returns: the new feedback_id.
+# read_feedback(con)
+#   Returns: data.frame(feedback_id, booking_id, person, rating, comment, at).
+#
+# export_responses(con, path)
+#   Writes responses, residents and consents to one .rds file to share between
+#   laptops. Contains names and emails, so do not commit it. Returns: path,
+#   invisibly.
+# import_responses(con, paths, prefer = NULL)
+#   Takes: paths  - one or more files from export_responses()
+#          prefer - who wins a conflict: a path from paths, or "database" for
+#                   this database's own rows. Several means first listed wins.
+#   Merges them into this database, all or nothing. A resident with different
+#   answers (or different residents details) in this database and the files
+#   stops the import with an error of class import_conflict, listing them in
+#   its $conflicts, unless prefer names a source that has them. Identical
+#   duplicates are fine and importing again changes nothing. Consents keep the
+#   earliest agreed_at. Bookings are never exported or imported. Residents in
+#   this database but not in the files are kept.
+#   Returns: list(responses, residents, consents), each counts of added,
+#            updated and unchanged, resolved (conflicts settled by prefer) and
+#            responses_not_in_residents (resident_ids).
 #
 # read_responses(con)
 #   Returns: data.frame in the same form as load_survey(), empty text as NA.
@@ -53,12 +107,14 @@
 #
 # read_bookings(con, person = NULL)
 #   Returns: data.frame(booking_id, person, machine, date, start, end, status,
-#            source), everyone's unless person is given.
+#            source, checked_in_at, finished_at), everyone's unless person is
+#            given.
 # add_bookings(con, schedule, source = "optimiser", status = "booked")
 #   Takes: schedule - data.frame(person, machine, date, start, end).
 #   Returns: the new booking_ids, in row order. All rows or none are added.
 # set_booking_status(con, booking_id, status)
-#   Stops if there is no such booking.
+#   Stops if there is no such booking. Status finished is refused: use
+#   check_out().
 #
 # read_changes(con, person = NULL)
 #   Returns: data.frame(person, booking_id, at, kind).
@@ -267,14 +323,7 @@ db_init <- function(con) {
        resident_id TEXT PRIMARY KEY,
        name TEXT, block TEXT, program TEXT, course TEXT,
        blocked TEXT, pref_days TEXT, pref_band TEXT)",
-    "CREATE TABLE IF NOT EXISTS bookings (
-       booking_id INTEGER PRIMARY KEY AUTOINCREMENT,
-       person TEXT NOT NULL, machine TEXT NOT NULL, date TEXT NOT NULL,
-       start TEXT NOT NULL, \"end\" TEXT NOT NULL,
-       status TEXT NOT NULL CHECK (status IN
-         ('booked', 'checked_in', 'released', 'no_show', 'moved')),
-       source TEXT NOT NULL CHECK (source IN
-         ('optimiser', 'change', 'queue', 'free_now')))",
+    bookings_table_sql("bookings"),
     "CREATE TABLE IF NOT EXISTS changes (
        person TEXT NOT NULL,
        booking_id INTEGER NOT NULL REFERENCES bookings (booking_id),
@@ -285,10 +334,436 @@ db_init <- function(con) {
        status TEXT NOT NULL CHECK (status IN
          ('waiting', 'served', 'withdrawn')))",
     "CREATE UNIQUE INDEX IF NOT EXISTS queue_one_waiting
-       ON queue (person) WHERE status = 'waiting'"
+       ON queue (person) WHERE status = 'waiting'",
+    "CREATE TABLE IF NOT EXISTS residents (
+       resident_id TEXT PRIMARY KEY,
+       name TEXT NOT NULL,
+       email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+       block TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS consents (
+       resident_id TEXT NOT NULL, agreed_at TEXT NOT NULL,
+       terms_version TEXT NOT NULL,
+       PRIMARY KEY (resident_id, terms_version))",
+    "CREATE TABLE IF NOT EXISTS feedback (
+       feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+       booking_id INTEGER NOT NULL UNIQUE REFERENCES bookings (booking_id),
+       person TEXT NOT NULL,
+       rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+       comment TEXT,
+       at TEXT NOT NULL)"
   )
   for (statement in statements) DBI::dbExecute(con, statement)
+  upgrade_bookings_table(con)
   invisible(con)
+}
+
+bookings_table_sql <- function(name) {
+  paste0(
+    "CREATE TABLE IF NOT EXISTS ", name, " (
+       booking_id INTEGER PRIMARY KEY AUTOINCREMENT,
+       person TEXT NOT NULL, machine TEXT NOT NULL, date TEXT NOT NULL,
+       start TEXT NOT NULL, \"end\" TEXT NOT NULL,
+       status TEXT NOT NULL CHECK (status IN
+         ('booked', 'checked_in', 'released', 'no_show', 'moved', 'finished')),
+       source TEXT NOT NULL CHECK (source IN
+         ('optimiser', 'change', 'queue', 'free_now')),
+       checked_in_at TEXT,
+       finished_at TEXT)"
+  )
+}
+
+bookings_table_is_current <- function(con) {
+  sql <- DBI::dbGetQuery(
+    con, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bookings'")$sql
+  grepl("'finished'", sql, fixed = TRUE) &&
+    all(c("checked_in_at", "finished_at") %in% DBI::dbListFields(con, "bookings"))
+}
+
+# SQLite cannot change a CHECK, so an older bookings table is copied into a new
+# one. Foreign keys are off during the swap so changes and feedback keep their
+# rows, and the ID counter is kept so an old booking_id is never reused.
+upgrade_bookings_table <- function(con) {
+  if (bookings_table_is_current(con)) return(invisible(FALSE))
+
+  foreign_keys <- DBI::dbGetQuery(con, "PRAGMA foreign_keys")[[1]]
+  DBI::dbExecute(con, "PRAGMA foreign_keys = OFF")
+  on.exit(DBI::dbExecute(con, paste("PRAGMA foreign_keys =", foreign_keys)))
+
+  DBI::dbExecute(con, "BEGIN IMMEDIATE")
+  tryCatch({
+    # Another session may have upgraded it while this one waited for the lock.
+    if (!bookings_table_is_current(con)) {
+      counter <- DBI::dbGetQuery(
+        con, "SELECT seq FROM sqlite_sequence WHERE name = 'bookings'")$seq
+      DBI::dbExecute(con, bookings_table_sql("bookings_upgrade"))
+      cols <- DBI::dbQuoteIdentifier(con, DBI::dbListFields(con, "bookings"))
+      cols <- paste(cols, collapse = ", ")
+      DBI::dbExecute(con, paste0("INSERT INTO bookings_upgrade (", cols, ") SELECT ",
+                                 cols, " FROM bookings"))
+      DBI::dbExecute(con, "DROP TABLE bookings")
+      DBI::dbExecute(con, "ALTER TABLE bookings_upgrade RENAME TO bookings")
+      DBI::dbExecute(con, "DELETE FROM sqlite_sequence WHERE name = 'bookings'")
+      if (length(counter) > 0) {
+        DBI::dbExecute(con, "INSERT INTO sqlite_sequence (name, seq) VALUES ('bookings', ?)",
+                       params = list(counter))
+      }
+    }
+    DBI::dbExecute(con, "COMMIT")
+  }, error = function(e) {
+    DBI::dbExecute(con, "ROLLBACK")
+    stop("Could not upgrade the bookings table, nothing changed: ",
+         conditionMessage(e), call. = FALSE)
+  })
+  invisible(TRUE)
+}
+
+load_participants <- function(path = "data/participants.csv") {
+  cols <- c("resident_id", "name", "email", "block")
+  participants <- read_data_csv(path, cols)
+  check_residents(participants[, cols], path)
+}
+
+# Trims and lower-cases, then stops on anything not fit to be a login list.
+check_residents <- function(df, where) {
+  cols <- c("resident_id", "name", "email", "block")
+  require_columns(df, cols, where)
+  df <- df[, cols]
+  df[] <- lapply(df, function(x) trimws(as.character(x)))
+  df$email <- tolower(df$email)
+  if (nrow(df) == 0) stop(where, ": no residents", call. = FALSE)
+  df[!is.na(df) & df == ""] <- NA_character_
+  require_values(df, cols, where)
+
+  bad <- which(!grepl("^[^@[:space:]]+@mse\\.ac\\.in$", df$email))
+  if (length(bad) > 0) {
+    stop(where, ": email must end in @mse.ac.in, check row(s) ",
+         paste0(bad, " (", df$email[bad], ")", collapse = ", "), call. = FALSE)
+  }
+  for (col in c("resident_id", "email")) {
+    repeats <- unique(df[[col]][duplicated(df[[col]])])
+    if (length(repeats) > 0) {
+      stop(where, ": ", col, " must be unique, repeated: ",
+           paste(repeats, collapse = ", "), call. = FALSE)
+    }
+  }
+  df
+}
+
+write_residents <- function(con, df) {
+  df <- check_residents(df, "write_residents()")
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "DELETE FROM residents")
+    DBI::dbAppendTable(con, "residents", df)
+  })
+  invisible(TRUE)
+}
+
+read_residents <- function(con) {
+  DBI::dbGetQuery(con, "SELECT resident_id, name, email, block FROM residents
+                        ORDER BY resident_id")
+}
+
+find_resident_by_email <- function(con, email) {
+  DBI::dbGetQuery(con, "SELECT resident_id, name, email, block FROM residents
+                        WHERE email = ?",
+                  params = list(tolower(trimws(email))))
+}
+
+record_consent <- function(con, resident_id, terms_version, at = Sys.time()) {
+  listed <- DBI::dbGetQuery(con, "SELECT COUNT(*) FROM residents WHERE resident_id = ?",
+                            params = list(resident_id))[[1]]
+  if (listed == 0) stop("Resident ", resident_id, " is not listed", call. = FALSE)
+  DBI::dbExecute(con, "INSERT OR IGNORE INTO consents (resident_id, agreed_at, terms_version)
+                       VALUES (?, ?, ?)",
+                 params = list(resident_id, time_text(at), terms_version))
+  invisible(TRUE)
+}
+
+has_consented <- function(con, resident_id, terms_version) {
+  DBI::dbGetQuery(con, "SELECT COUNT(*) FROM consents
+                        WHERE resident_id = ? AND terms_version = ?",
+                  params = list(resident_id, terms_version))[[1]] > 0
+}
+
+check_in <- function(con, booking_id, at = Sys.time(), config = load_config()) {
+  at <- as_local_time(at)
+  booking <- booking_row(con, booking_id)
+  if (booking$status != "booked") {
+    stop("Booking ", booking_id, " cannot be checked in: its status is ",
+         booking$status, call. = FALSE)
+  }
+  grace <- config$rules$checkin_grace_min
+  if (is.null(grace)) grace <- 15
+  opens <- as_local_time(paste(booking$date, booking$start))
+  closes <- opens + grace * 60
+  if (at < opens || at > closes) {
+    stop("Booking ", booking_id, " can only be checked in from ",
+         format(opens, "%Y-%m-%d %H:%M"), " to ", format(closes, "%H:%M"),
+         call. = FALSE)
+  }
+  DBI::dbExecute(con, "UPDATE bookings SET status = 'checked_in', checked_in_at = ?
+                       WHERE booking_id = ?",
+                 params = list(time_text(at), booking_id))
+  invisible(TRUE)
+}
+
+check_out <- function(con, booking_id, at = Sys.time()) {
+  at <- as_local_time(at)
+  booking <- booking_row(con, booking_id)
+  if (booking$status != "checked_in") {
+    stop("Booking ", booking_id, " cannot be checked out: its status is ",
+         booking$status, call. = FALSE)
+  }
+  # Bookings checked in through set_booking_status() have no time to compare.
+  if (!is.na(booking$checked_in_at) && at < as_local_time(booking$checked_in_at)) {
+    stop("Booking ", booking_id, " cannot be checked out before its check-in at ",
+         booking$checked_in_at, call. = FALSE)
+  }
+  DBI::dbExecute(con, "UPDATE bookings SET status = 'finished', finished_at = ?
+                       WHERE booking_id = ?",
+                 params = list(time_text(at), booking_id))
+  invisible(TRUE)
+}
+
+add_feedback <- function(con, booking_id, rating, comment = NA, at = Sys.time()) {
+  booking <- booking_row(con, booking_id)
+  if (booking$status != "finished") {
+    stop("Booking ", booking_id, " has no feedback yet because it is not finished: ",
+         "its status is ", booking$status, call. = FALSE)
+  }
+  number <- suppressWarnings(as.numeric(rating))
+  if (length(number) != 1 || is.na(number) || number != round(number) ||
+      number < 1 || number > 5) {
+    stop("Rating must be a whole number from 1 to 5, got: ",
+         paste(rating, collapse = ", "), call. = FALSE)
+  }
+  given <- DBI::dbGetQuery(con, "SELECT COUNT(*) FROM feedback WHERE booking_id = ?",
+                           params = list(booking_id))[[1]]
+  if (given > 0) {
+    stop("Booking ", booking_id, " already has feedback", call. = FALSE)
+  }
+  if (is.null(comment) || length(comment) == 0 || is.na(comment) ||
+      trimws(comment) == "") {
+    comment <- NA_character_
+  }
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "INSERT INTO feedback (booking_id, person, rating, comment, at)
+                         VALUES (?, ?, ?, ?, ?)",
+                   params = list(booking_id, booking$person, as.integer(number),
+                                 as.character(comment), time_text(at)))
+    as.integer(DBI::dbGetQuery(con, "SELECT last_insert_rowid()")[[1]])
+  })
+}
+
+read_feedback <- function(con) {
+  DBI::dbGetQuery(con, "SELECT feedback_id, booking_id, person, rating, comment, at
+                        FROM feedback ORDER BY feedback_id")
+}
+
+booking_row <- function(con, booking_id) {
+  booking <- DBI::dbGetQuery(con, "SELECT * FROM bookings WHERE booking_id = ?",
+                             params = list(booking_id))
+  if (nrow(booking) == 0) stop("No booking with id ", booking_id, call. = FALSE)
+  booking
+}
+
+# POSIXct from a time or "YYYY-MM-DD HH:MM[:SS]" text, in local time.
+as_local_time <- function(x) {
+  if (inherits(x, "POSIXt")) return(as.POSIXct(x))
+  time <- as.POSIXct(as.character(x), format = "%Y-%m-%d %H:%M:%S")
+  if (is.na(time)) time <- as.POSIXct(as.character(x), format = "%Y-%m-%d %H:%M")
+  if (is.na(time)) stop("Cannot read the time '", x, "'", call. = FALSE)
+  time
+}
+
+export_tables <- function(con) {
+  list(responses = read_responses(con),
+       residents = read_residents(con),
+       consents = DBI::dbGetQuery(
+         con, "SELECT resident_id, agreed_at, terms_version FROM consents"))
+}
+
+export_responses <- function(con, path) {
+  if (!grepl("\\.rds$", path, ignore.case = TRUE)) {
+    stop("Export file must end in .rds, got: ", path, call. = FALSE)
+  }
+  saveRDS(c(list(format = "hostel_laundry_export", exported_at = time_text(Sys.time())),
+            export_tables(con)), path)
+  invisible(path)
+}
+
+# Only the three shared tables are taken from a file, whatever else it holds.
+read_export <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path, call. = FALSE)
+  data <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (!is.list(data) || !identical(data$format, "hostel_laundry_export")) {
+    stop(path, " is not a file from export_responses()", call. = FALSE)
+  }
+  required <- list(
+    responses = c("resident_id", "name", "block", "program", "course", "blocked",
+                  "pref_days", "pref_band"),
+    residents = c("resident_id", "name", "email", "block"),
+    consents = c("resident_id", "agreed_at", "terms_version")
+  )
+  lapply(setNames(names(required), names(required)), function(table) {
+    require_columns(data[[table]], required[[table]], paste0(path, ", ", table))
+    data[[table]][, required[[table]], drop = FALSE]
+  })
+}
+
+# Finds one winning row per resident across sources, a named list of
+# data.frames. Returns list(rows, conflicts, resolved).
+merge_import_rows <- function(sources, table, cols, prefer) {
+  all_rows <- do.call(rbind, lapply(names(sources), function(label) {
+    rows <- sources[[label]]
+    if (nrow(rows) == 0) return(NULL)
+    cbind(rows, source = label, stringsAsFactors = FALSE)
+  }))
+  no_rows <- list(rows = sources[[1]][0, cols, drop = FALSE], conflicts = NULL,
+                  resolved = NULL)
+  if (is.null(all_rows)) return(no_rows)
+  all_rows[cols][is.na(all_rows[cols])] <- ""
+
+  winners <- list()
+  conflicts <- list()
+  resolved <- list()
+  for (group in split(all_rows, all_rows$resident_id)) {
+    differing <- cols[vapply(cols, function(col) length(unique(group[[col]])) > 1, TRUE)]
+    if (length(differing) == 0) {
+      winners[[length(winners) + 1]] <- group[1, cols]
+      next
+    }
+    report <- data.frame(table = table, resident_id = group$resident_id[1],
+                         columns = paste(differing, collapse = ", "),
+                         sources = paste(group$source, collapse = " | "))
+    chosen <- intersect(prefer, group$source)
+    if (length(chosen) == 0) {
+      conflicts[[length(conflicts) + 1]] <- report
+    } else {
+      winners[[length(winners) + 1]] <- group[group$source == chosen[1], cols][1, ]
+      report$winner <- chosen[1]
+      resolved[[length(resolved) + 1]] <- report
+    }
+  }
+  rows <- do.call(rbind, winners)
+  if (is.null(rows)) rows <- no_rows$rows
+  rows[rows == ""] <- NA_character_
+  list(rows = rows, conflicts = do.call(rbind, conflicts),
+       resolved = do.call(rbind, resolved))
+}
+
+# Compares winners with this database. Returns list(new, changed, counts).
+import_changes <- function(rows, current, cols) {
+  key <- function(df) {
+    df[is.na(df)] <- ""
+    do.call(paste, c(df[cols], sep = "\r"))
+  }
+  is_new <- !rows$resident_id %in% current$resident_id
+  is_changed <- !is_new & !key(rows) %in% key(current)
+  list(rows = rows[is_new | is_changed, cols, drop = FALSE],
+       counts = c(added = sum(is_new), updated = sum(is_changed),
+                  unchanged = sum(!is_new & !is_changed)))
+}
+
+import_responses <- function(con, paths, prefer = NULL) {
+  if (length(paths) == 0) stop("No files to import", call. = FALSE)
+  real_path <- function(p) normalizePath(p, winslash = "/", mustWork = FALSE)
+  paths <- paths[!duplicated(real_path(paths))]
+  files <- setNames(lapply(paths, read_export), paths)
+
+  prefer <- as.character(prefer)
+  unknown <- prefer[prefer != "database" & !real_path(prefer) %in% real_path(paths)]
+  if (length(unknown) > 0) {
+    stop("prefer must be one of the files being imported or \"database\", got: ",
+         paste(unknown, collapse = ", "), call. = FALSE)
+  }
+  labels <- paths[match(real_path(prefer), real_path(paths))]
+  prefer <- ifelse(prefer == "database", "database", labels)
+
+  current <- export_tables(con)
+  from <- function(table) {
+    c(list(database = current[[table]]), lapply(files, `[[`, table))
+  }
+  response_cols <- names(current$responses)
+  resident_cols <- names(current$residents)
+  responses <- merge_import_rows(from("responses"), "responses", response_cols, prefer)
+  residents <- merge_import_rows(from("residents"), "residents", resident_cols, prefer)
+
+  conflicts <- rbind(responses$conflicts, residents$conflicts)
+  if (!is.null(conflicts)) {
+    lines <- paste0("  ", conflicts$table, " ", conflicts$resident_id, ": ",
+                    conflicts$columns, " differ between ", conflicts$sources)
+    stop(structure(
+      class = c("import_conflict", "error", "condition"),
+      list(message = paste0(
+        "Different answers for the same resident, nothing imported:\n",
+        paste(lines, collapse = "\n"),
+        "\nChoose who wins with prefer = \"<path>\" or prefer = \"database\"."),
+        call = NULL, conflicts = conflicts)
+    ))
+  }
+
+  merged <- residents$rows
+  if (nrow(merged) > 0) {
+    repeats <- unique(merged$email[duplicated(merged$email)])
+    if (length(repeats) > 0) {
+      stop("Nothing imported: the same email is on different resident IDs: ",
+           paste(repeats, collapse = ", "), call. = FALSE)
+    }
+  }
+
+  new_responses <- import_changes(responses$rows, current$responses, response_cols)
+  new_residents <- import_changes(residents$rows, current$residents, resident_cols)
+
+  consents <- do.call(rbind, from("consents"))
+  bad_times <- consents$agreed_at[
+    !grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$", consents$agreed_at)]
+  if (length(bad_times) > 0) {
+    stop("Nothing imported: cannot read consent time(s): ",
+         paste(unique(bad_times), collapse = ", "), call. = FALSE)
+  }
+  earliest <- consents[order(consents$agreed_at), ]
+  earliest <- earliest[!duplicated(earliest[, c("resident_id", "terms_version")]), ]
+  now_held <- merge(earliest, current$consents, by = c("resident_id", "terms_version"),
+                    all.x = TRUE, suffixes = c("", "_now"))
+  consent_new <- now_held[is.na(now_held$agreed_at_now), ]
+  consent_earlier <- now_held[!is.na(now_held$agreed_at_now) &
+                                now_held$agreed_at < now_held$agreed_at_now, ]
+
+  DBI::dbWithTransaction(con, {
+    for (id in new_responses$rows$resident_id) {
+      DBI::dbExecute(con, "DELETE FROM responses WHERE resident_id = ?", params = list(id))
+    }
+    if (nrow(new_responses$rows) > 0) {
+      DBI::dbAppendTable(con, "responses", new_responses$rows)
+    }
+    for (id in new_residents$rows$resident_id) {
+      DBI::dbExecute(con, "DELETE FROM residents WHERE resident_id = ?", params = list(id))
+    }
+    if (nrow(new_residents$rows) > 0) {
+      DBI::dbAppendTable(con, "residents", new_residents$rows)
+    }
+    if (nrow(consent_new) > 0) {
+      DBI::dbAppendTable(con, "consents",
+                         consent_new[, c("resident_id", "agreed_at", "terms_version")])
+    }
+    for (i in seq_len(nrow(consent_earlier))) {
+      DBI::dbExecute(
+        con, "UPDATE consents SET agreed_at = ? WHERE resident_id = ? AND terms_version = ?",
+        params = list(consent_earlier$agreed_at[i], consent_earlier$resident_id[i],
+                      consent_earlier$terms_version[i]))
+    }
+  })
+
+  held <- read_residents(con)$resident_id
+  list(
+    responses = new_responses$counts,
+    residents = new_residents$counts,
+    consents = c(added = nrow(consent_new), updated = nrow(consent_earlier),
+                 unchanged = nrow(now_held) - nrow(consent_new) - nrow(consent_earlier)),
+    resolved = rbind(responses$resolved, residents$resolved),
+    responses_not_in_residents = setdiff(read_responses(con)$resident_id, held)
+  )
 }
 
 read_responses <- function(con) {
@@ -312,7 +787,8 @@ write_responses <- function(con, rows) {
 
 read_bookings <- function(con, person = NULL) {
   read_rows(con, "SELECT booking_id, person, machine, date, start, \"end\",
-    status, source FROM bookings", "person", person, "date, start, booking_id")
+    status, source, checked_in_at, finished_at FROM bookings", "person", person,
+    "date, start, booking_id")
 }
 
 add_bookings <- function(con, schedule, source = "optimiser", status = "booked") {
@@ -333,6 +809,9 @@ add_bookings <- function(con, schedule, source = "optimiser", status = "booked")
 }
 
 set_booking_status <- function(con, booking_id, status) {
+  if (identical(status, "finished")) {
+    stop("Use check_out() to finish booking ", booking_id, call. = FALSE)
+  }
   updated <- DBI::dbExecute(con, "UPDATE bookings SET status = ? WHERE booking_id = ?",
                             params = list(status, booking_id))
   if (updated == 0) stop("No booking with id ", booking_id, call. = FALSE)
