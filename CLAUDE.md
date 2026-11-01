@@ -20,6 +20,7 @@ can join a queue for extra slots that others release.
 Run with `shiny::runApp()`. Files in `R/` are sourced automatically.
 The app assumes the laptops it runs on are set to India time (IST): slot
 times, check-in and the change cutoff all use the computer's clock.
+The laundry machines run 24 hours (00:00-24:00); residents' sleep is handled by their own blocked times; the last normal wash starts 22:30 and the last quick wash 23:00 so the buffer ends by midnight.
 
 ## File ownership
 
@@ -190,7 +191,7 @@ optimiser takes, one row per free stretch of time:
 - `rules,reserve_share,<0-1>`: share of machine time per block per date kept free as emergency reserve (default 0)
 - `rules,peak_target,<minutes>`: booked machine-minutes per block per clock hour above which the optimiser applies a penalty (default: no penalty)
 - `out_of_order,<machine id>,1`: machine that must not be used, e.g. `out_of_order,C-2,1` (default: none)
-- `band,<name>,HH:MM-HH:MM`: time bands for `pref_band`, e.g. `band,evening,17:00-23:00`
+- `band,<name>,HH:MM-HH:MM`: time bands for `pref_band`, e.g. `band,evening,17:00-24:00`
 
 All rows except `machines`, `program` and `hours,open|close|days` are optional.
 

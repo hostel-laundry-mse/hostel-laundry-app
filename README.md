@@ -42,6 +42,8 @@ Rscript -e "shiny::runApp(launch.browser = TRUE)"
 
 ## Data
 
+The laundry machines run 24 hours (00:00-24:00); residents' sleep is handled by their own blocked times; the last normal wash starts 22:30 and the last quick wash 23:00 so the buffer ends by midnight.
+
 - `data/config.csv`: machines per block, programs and durations, opening hours, scheduling rules.
 - `data/timetable.csv`: weekly lecture timetable per course.
 - `data/fake_survey.csv`: made-up residents for development.

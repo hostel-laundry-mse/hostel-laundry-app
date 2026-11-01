@@ -24,7 +24,7 @@
 BLOCKC_COURSES <- c("DS", "MBA", "FE", "AQF", "EE", "AE", "GE")
 
 BLOCKC_BANDS <- c("12 PM - 4 PM" = "afternoon", "4 PM - 8 PM" = "evening",
-                  "8 PM - 12 AM" = "evening", "12 AM - 4 AM" = "")
+                  "8 PM - 12 AM" = "evening", "12 AM - 4 AM" = "night")
 
 BLOCKC_FIRST_NAMES <- c(
   "Ananya", "Bhavna", "Chitra", "Deepa", "Esha", "Farah", "Gauri", "Hina",
@@ -50,9 +50,7 @@ simulate_blockC <- function(source_path = "data/Hostel_Laundry_Clean.csv",
     p <- picked[i, ]
     band <- blockc_band(p$pref_time)
     windows <- if (blocked_from == "simulated") {
-      # 12 AM - 4 AM respondents have no band but keep late hours too.
-      blockc_blocked_windows(late = band == "evening" ||
-                               p$pref_time == "12 AM - 4 AM")
+      blockc_blocked_windows(band)
     } else {
       parse_windows(real_blocked[sample.int(length(real_blocked), 1)])
     }
@@ -113,8 +111,13 @@ blockc_real_blocked <- function(con) {
 # One person's week as data.frame(day, start, end), minutes after midnight of
 # day, on 30-minute steps: the same sleep block every night, plus 0-2 personal
 # blocks that do not touch sleep, each other or the previous night's sleep.
-blockc_blocked_windows <- function(late) {
-  bedtime <- blockc_pick(if (late) c(1440, 1470, 1500) else c(1350, 1380, 1410))
+blockc_blocked_windows <- function(band) {
+  bedtime <- blockc_pick(switch(
+    band,
+    night = c(1620, 1650, 1680),    # 03:00 to 04:00, so part of the night is free
+    evening = c(1440, 1470, 1500),  # 00:00 to 01:00
+    c(1350, 1380, 1410)             # 22:30 to 23:30
+  ))
   sleep_length <- blockc_pick(c(420, 450, 480))
   windows <- do.call(rbind, lapply(seq_along(WEEKDAYS), function(d) {
     # A bedtime after midnight belongs to the next day, as the form writes it.
