@@ -90,7 +90,9 @@ TERMS <- list(
     "We collect your name, block, course, blocked times and preferences only to build and evaluate the laundry schedule, as part of a statistics course project.",
     "Only the project team and the course instructor can see it. It is not shared elsewhere, and results are reported in aggregate without identifying you.",
     "Taking part is voluntary. You can ask for your answers to be removed at any time.")),
-  list(title = "8. Other", bullets = c(
+  list(title = "8. Data Policy", bullets = c(
+    "Data will be deleted at the end of each academic year.")),
+  list(title = "9. Other", bullets = c(
     "This is a pilot. The schedule may change if machines are unavailable or rules are updated, and the team will tell residents when that happens."))
 )
 
