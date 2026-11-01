@@ -105,6 +105,9 @@ FALLBACK_DAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 FALLBACK_BLOCKS <- c("A", "B", "C", "D")
 FALLBACK_COURSES <- c("DS", "FE", "GE", "AE", "AQF", "EE", "MBA")
 FALLBACK_PROGRAMS <- c(quick = 30, normal = 60)
+# The time band dropdown starts on "" (not answered yet); this value is the
+# explicit answer "No preference", saved as "" (the survey format for none).
+BAND_NONE <- "none"
 FALLBACK_BANDS <- c("morning", "afternoon", "evening")
 FALLBACK_MAX_BLOCKED_HOURS <- 10
 FALLBACK_RESIDENTS <- data.frame(
@@ -167,6 +170,23 @@ q_courses <- function(path = PATH_TIMETABLE) {
     return(unique(t$course))
   }
   FALLBACK_COURSES
+}
+
+# Blocks for the Block dropdown: the machines keys of data/config.csv; if the
+# config lists none, the blocks in the residents table; the fallback only if
+# both are empty.
+q_blocks <- function(con = NULL, path = PATH_CONFIG) {
+  tab <- read_csv_chr(path)
+  if (is.data.frame(tab) && all(c("section", "key") %in% names(tab))) {
+    keys <- unique(tab$key[tab$section == "machines"])
+    if (length(keys) > 0) return(keys)
+  }
+  if (!is.null(con)) {
+    r <- tryCatch(read_residents(con), error = function(e) NULL)
+    b <- if (is.data.frame(r)) unique(r$block[!is.na(r$block) & nzchar(r$block)])
+    if (length(b) > 0) return(sort(b))
+  }
+  FALLBACK_BLOCKS
 }
 
 # Sample residents (survey format).
@@ -288,25 +308,30 @@ test_blocked_helpers <- function() {
   invisible(TRUE)
 }
 
-# Sleep: one blocked window per day with the chosen times. `to` earlier than
-# `from` is the normal overnight case (it counts towards the start day, like
-# any window past midnight). Windows from an earlier sleep pair (`previous`,
-# c(start, end) in minutes) are replaced, and an identical window already there
-# is not added twice. Returns list(windows, pair); stops if from == to.
+# Sleep: one blocked window per chosen day (`days`) with the chosen times. `to`
+# earlier than `from` is the normal overnight case (it counts towards the start
+# day, like any window past midnight). Windows from earlier sleep (`previous`:
+# a c(start, end) pair in minutes for all `days`, or a data.frame of day, start,
+# end with each day's own earlier sleep) are replaced on those days only, and an
+# identical window already there is not added twice. Returns list(windows, pair,
+# sleep), sleep being the data.frame of the windows for `days`; stops if
+# from == to.
 add_sleep <- function(windows, from, to, days = FALLBACK_DAYS, previous = NULL) {
   s <- hhmm_to_min(from)
   e <- hhmm_to_min(to)
   if (e == s) stop("Sleep 'To' must differ from 'From'.", call. = FALSE)
   if (e < s) e <- e + 1440L
+  key <- function(w) paste(w$day, w$start, w$end)
   if (!is.null(previous)) {
-    windows <- windows[!(windows$day %in% days & windows$start == previous[1] &
-                           windows$end == previous[2]), , drop = FALSE]
+    prev <- if (is.data.frame(previous)) previous else
+      data.frame(day = days, start = previous[1], end = previous[2])
+    prev <- prev[prev$day %in% days, , drop = FALSE]
+    windows <- windows[!key(windows) %in% key(prev), , drop = FALSE]
   }
   new <- data.frame(day = days, start = s, end = e, stringsAsFactors = FALSE)
-  key <- function(w) paste(w$day, w$start, w$end)
   windows <- rbind(windows, new[!key(new) %in% key(windows), , drop = FALSE])
   rownames(windows) <- NULL
-  list(windows = windows, pair = c(s, e))
+  list(windows = windows, pair = c(s, e), sleep = new)
 }
 
 test_sleep_windows <- function() {
@@ -341,6 +366,14 @@ test_sleep_windows <- function() {
                      previous = r$pair)
   stopifnot(nrow(mixed$windows) == 8, "Mon 09:00-10:30" %in%
               strsplit(format_windows(mixed$windows, days), ";")[[1]])
+  # a subset of days, with each day's own earlier sleep replaced separately
+  wk <- add_sleep(empty_windows(), "22:30", "06:30", days[1:5])
+  we <- add_sleep(wk$windows, "00:00", "09:00", days[6:7])
+  stopifnot(nrow(we$windows) == 7, identical(we$sleep$day, c("Sat", "Sun")))
+  tracked <- rbind(wk$sleep, we$sleep)
+  fri <- add_sleep(we$windows, "23:30", "07:30", "Fri", previous = tracked)
+  stopifnot(nrow(fri$windows) == 7, fri$windows$start[fri$windows$day == "Fri"] == 1410L,
+            sum(fri$windows$start == 1350L) == 4, sum(fri$windows$start == 0L) == 2)
   # bad pair
   stopifnot(inherits(tryCatch(add_sleep(empty_windows(), "07:00", "07:00", days),
                               error = function(e) e), "error"))
@@ -353,18 +386,41 @@ test_sleep_windows <- function() {
   shiny::testServer(mod_questionnaire_server, args = list(con = NULL), {
     session$setInputs(demo = TRUE, user = "R001", login = 1)
     blocked(empty_windows())
-    session$setInputs(sleep_from = "23:00", sleep_to = "07:00", b_sleep = 1)
+    session$setInputs(sleep_days = FALLBACK_DAYS, sleep_from = "23:00",
+                      sleep_to = "07:00", b_sleep = 1)
     stopifnot(nrow(blocked()) == 7)
     session$setInputs(sleep_from = "22:30", sleep_to = "06:30", b_sleep = 2)
     stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1350L))   # replaced
     session$setInputs(b_sel = "3", b_remove = 1)                      # remove Wed only
     stopifnot(nrow(blocked()) == 6, !"Wed" %in% blocked()$day)
-    session$setInputs(course = "DS", program = "quick", pref_band = "",
+    session$setInputs(block = "A", course = "DS", program = "quick", pref_band = "none",
                       pref_days = "Sat", terms = TRUE, save = 1)
     saved <- parse_windows(last_response()$blocked)
     stopifnot(nrow(saved) == 6, all(saved$start == 1350L), all(saved$end == 1830L))
     session$setInputs(sleep_from = "23:00", sleep_to = "07:00", b_sleep = 3)
     stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1380L))    # Wed is back
+    # "same for each day" unticked: one Sleep day at a time, each with its own times
+    session$setInputs(b_clear = 1)
+    session$setInputs(sleep_same = FALSE, sleep_day = "Mon", sleep_from = "22:30",
+                      sleep_to = "06:30", b_sleep = 4)
+    stopifnot(nrow(blocked()) == 1, blocked()$day == "Mon")
+    session$setInputs(sleep_day = "Sat", sleep_from = "00:00", sleep_to = "09:00",
+                      b_sleep = 5)
+    session$setInputs(sleep_day = "Tue", sleep_from = "22:30", sleep_to = "06:30",
+                      b_sleep = 6)
+    w <- blocked()
+    stopifnot(nrow(w) == 3, w$start[w$day == "Sat"] == 0L,
+              w$end[w$day == "Sat"] == 540L, w$start[w$day == "Mon"] == 1350L)
+    # change only Monday: replaced, the other days keep their own times
+    session$setInputs(sleep_day = "Mon", sleep_from = "23:30", sleep_to = "07:30",
+                      b_sleep = 7)
+    w <- blocked()
+    stopifnot(nrow(w) == 3, w$start[w$day == "Mon"] == 1410L,
+              w$start[w$day == "Tue"] == 1350L, w$start[w$day == "Sat"] == 0L)
+    # ticked again: all seven days at once, replacing the earlier sleep
+    session$setInputs(sleep_same = TRUE, sleep_from = "23:00", sleep_to = "07:00",
+                      b_sleep = 8)
+    stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1380L))
   })
   invisible(TRUE)
 }
@@ -466,6 +522,122 @@ time_choices <- function(from = "00:00", to = "24:00", step = 30) {
   min_to_hhmm(seq(hhmm_to_min(from), hhmm_to_min(to), by = step))
 }
 
+# ---- Required answers --------------------------------------------------------
+
+# The value saved in pref_band for a dropdown value.
+band_value <- function(x) if (is.null(x) || identical(x, BAND_NONE)) "" else x
+
+# Every question is required. Returns a named list with one message per missing
+# answer (names: block, course, pref_days, pref_band, blocked, terms); empty
+# when everything is complete. The block must be one of `blocks` and equal to
+# the block in the signed-in resident's row (`resident_block`). Blocked times need at least one window or the
+# explicit "I have no blocked times" tick. Used for the red messages, for the
+# Save button and again on Save, so a skipped answer is never written.
+missing_answers <- function(block, resident_block, course, pref_days,
+                            pref_band, blocked, no_blocked, terms,
+                            blocks = FALLBACK_BLOCKS, courses = q_courses(),
+                            days = FALLBACK_DAYS, bands = FALLBACK_BANDS) {
+  one <- function(x) length(x) == 1 && !is.na(x)
+  out <- list()
+  if (!(one(block) && block %in% blocks)) {
+    out$block <- "Please choose your block."
+  } else if (length(resident_block) == 1 && !identical(block, resident_block)) {
+    out$block <- paste0("Your block in the participant list is ", resident_block,
+                        ". Please select ", resident_block, ".")
+  }
+  if (!(one(course) && course %in% courses)) {
+    out$course <- "Please choose your course."
+  }
+  if (length(pref_days) == 0 || !all(pref_days %in% days)) {
+    out$pref_days <- "Please tick at least one preferred day."
+  }
+  if (!(one(pref_band) && pref_band %in% c(BAND_NONE, bands))) {
+    out$pref_band <- "Please choose a preferred time band (or No preference)."
+  }
+  if (nrow(blocked) == 0 && !isTRUE(no_blocked)) {
+    out$blocked <- paste("Add at least one blocked-time window, or tick",
+                         "\"I have no blocked times\".")
+  }
+  if (!isTRUE(terms)) {
+    out$terms <- "You must agree to the Terms of Use and the data policy."
+  }
+  out
+}
+
+test_required_fields <- function() {
+  w <- parse_windows("Mon 23:00-07:00")
+  none <- empty_windows()
+  courses <- c("DS", "IMA")
+  bands <- c("morning", "evening")
+  miss <- function(course = "DS", pref_days = "Sat", pref_band = "evening",
+                   blocked = w, no_blocked = FALSE, terms = TRUE,
+                   block = "B", resident_block = "B") {
+    names(missing_answers(block, resident_block, course, pref_days, pref_band,
+                          blocked, no_blocked, terms, c("A", "B"), courses,
+                          FALLBACK_DAYS, bands))
+  }
+  msg <- function(...) {
+    missing_answers(..., blocked = w, no_blocked = FALSE, terms = TRUE,
+                    course = "DS", pref_days = "Sat", pref_band = "evening",
+                    blocks = c("A", "B"), courses = courses,
+                    days = FALLBACK_DAYS, bands = bands)$block
+  }
+  # block: empty, unknown, or not the resident's own block; a match is fine
+  stopifnot(identical(miss(block = ""), "block"),
+            identical(miss(block = NULL), "block"),
+            identical(miss(block = "Z"), "block"),
+            identical(miss(block = "A"), "block"),
+            length(miss(block = "A", resident_block = "A")) == 0)
+  stopifnot(identical(msg(block = "", resident_block = "B"), "Please choose your block."),
+            identical(msg(block = "A", resident_block = "B"),
+                      "Your block in the participant list is B. Please select B."))
+  # all complete: windows, or the explicit "no blocked times" tick
+  stopifnot(length(miss()) == 0, length(miss(blocked = none, no_blocked = TRUE)) == 0)
+  # "No preference" is an answer; the saved value is empty
+  stopifnot(length(miss(pref_band = BAND_NONE)) == 0, band_value(BAND_NONE) == "",
+            band_value("evening") == "evening")
+  # each missing field on its own gives exactly its own message
+  stopifnot(identical(miss(course = ""), "course"),
+            identical(miss(course = NULL), "course"),
+            identical(miss(course = "XX"), "course"),
+            identical(miss(pref_days = NULL), "pref_days"),
+            identical(miss(pref_days = character(0)), "pref_days"),
+            identical(miss(pref_days = "Funday"), "pref_days"),
+            identical(miss(pref_band = ""), "pref_band"),
+            identical(miss(pref_band = NULL), "pref_band"),
+            identical(miss(pref_band = "midnight"), "pref_band"),
+            identical(miss(terms = FALSE), "terms"),
+            identical(miss(terms = NULL), "terms"))
+  # blocked times: neither windows nor the tick is missing; the tick alone is enough
+  stopifnot(identical(miss(blocked = none), "blocked"),
+            identical(miss(blocked = none, no_blocked = FALSE), "blocked"),
+            identical(miss(blocked = none, no_blocked = NULL), "blocked"),
+            length(miss(blocked = none, no_blocked = TRUE)) == 0)
+  # everything missing: all five are reported
+  stopifnot(identical(
+    miss(block = "", course = "", pref_days = NULL, pref_band = "",
+         blocked = none, terms = FALSE),
+    c("block", "course", "pref_days", "pref_band", "blocked", "terms")))
+  invisible(TRUE)
+}
+
+test_q_blocks <- function() {
+  none <- tempfile(fileext = ".csv")
+  writeLines(c("section,key,value", "program,quick,30"), none)
+  stopifnot(identical(q_blocks(NULL), q_blocks(NULL, PATH_CONFIG)),
+            all(c("A", "B", "C", "D") %in% q_blocks(NULL)))
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  db_init(con)
+  write_residents(con, data.frame(resident_id = c("X1", "X2"), name = c("a", "b"),
+                                  email = c("a@mse.ac.in", "b@mse.ac.in"),
+                                  block = c("C", "C")))
+  # config lists no blocks: the residents table; with no residents, the fallback
+  stopifnot(identical(q_blocks(con, none), "C"),
+            identical(q_blocks(NULL, none), FALLBACK_BLOCKS))
+  invisible(TRUE)
+}
+
 # Server-level checks: sign-in against residents, the terms blocking submit, the
 # consent flow, and the demo login. Needs shiny, bslib, DBI and RSQLite, and
 # R/data_load.R, sourced first.
@@ -476,7 +648,8 @@ test_save_flow <- function() {
   write_residents(con, data.frame(
     resident_id = c("P001", "P002"), name = c("Priya Test", "Dev Test"),
     email = c("test.person@mse.ac.in", "other@mse.ac.in"), block = c("B", "D")))
-  form <- list(course = "DS", program = "quick", pref_band = "", pref_days = "Sat")
+  form <- list(block = "B", course = "DS", program = "quick",
+               pref_band = "evening", pref_days = "Sat", no_blocked = TRUE)
   consents <- function() DBI::dbGetQuery(con, "SELECT * FROM consents")
   shiny::testServer(mod_questionnaire_server, args = list(con = con), {
     # not signed in: nothing is saved
@@ -490,7 +663,7 @@ test_save_flow <- function() {
     # listed email (any case, spaces around): id, name and block from residents
     session$setInputs(email = "  Test.Person@MSE.AC.IN ", email_go = 3)
     stopifnot(identical(current_user(), "P001"),
-              grepl("Priya Test", output$identity$html), grepl("B", output$identity$html))
+              grepl("Priya Test", output$identity$html))
     # terms not ticked: no consent, no answers
     do.call(session$setInputs, c(form, list(terms = FALSE, save = 2)))
     stopifnot(is.null(last_response()), nrow(read_responses(con)) == 0,
@@ -515,23 +688,82 @@ test_save_flow <- function() {
     # another resident, in block D
     session$setInputs(email = "other@mse.ac.in", email_go = 4)
     stopifnot(identical(current_user(), "P002"))
-    session$setInputs(terms = TRUE, save = 6)
+    session$setInputs(block = "D", terms = TRUE, save = 6)
     r <- read_responses(con)
     stopifnot(nrow(r) == 2, r$block[r$resident_id == "P002"] == "D")
     # demo login: a sample resident still saves a valid row; no consent (not listed)
     session$setInputs(demo = TRUE, user = "R001", login = 1)
-    session$setInputs(terms = TRUE, save = 7)
+    session$setInputs(block = "A", terms = TRUE, save = 7)
     r <- read_responses(con)
     stopifnot(nrow(r) == 3, identical(names(r), SURVEY_COLUMNS),
               r$name[r$resident_id == "R001"] == residents$name[residents$resident_id == "R001"],
               !has_consented(con, "R001", TERMS_VERSION))
+  })
+  # every answer is required: a skipped one is never saved and shows a red message
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  db_init(con2)
+  write_residents(con2, data.frame(resident_id = "P001", name = "Priya Test",
+                                   email = "test.person@mse.ac.in", block = "B"))
+  full <- list(block = "B", course = "DS", program = "quick", pref_band = "evening",
+               pref_days = "Sat", no_blocked = TRUE, terms = TRUE)
+  shiny::testServer(mod_questionnaire_server, args = list(con = con2), {
+    session$setInputs(email = "test.person@mse.ac.in", email_go = 1)
+    n <- 0
+    try_save <- function(...) {
+      n <<- n + 1
+      do.call(session$setInputs, c(modifyList(full, list(...)), list(save = n)))
+    }
+    saved <- function() nrow(read_responses(con2))
+    blank <- function(x) is.na(x) || x == ""   # read_responses() gives NA for empty
+    # nothing answered yet: every field shows its message
+    session$setInputs(block = "", course = "", pref_band = "", pref_days = NULL,
+                      no_blocked = FALSE, terms = FALSE)
+    for (f in c("block", "course", "pref_days", "pref_band", "blocked", "terms")) {
+      stopifnot(grepl("text-danger", output[[paste0("err_", f)]]$html))
+    }
+    # block: empty, then not the block in the participant list (B), then matching
+    try_save(block = "")
+    stopifnot(saved() == 0, grepl("Please choose your block.", output$save_result$html))
+    try_save(block = "A")
+    stopifnot(saved() == 0, nrow(DBI::dbGetQuery(con2, "SELECT * FROM consents")) == 0,
+              grepl("Your block in the participant list is B. Please select B.",
+                    output$save_result$html),
+              grepl("Please select B", output$err_block$html))
+    # each other field missing on its own: not saved, its own message
+    try_save(course = "")
+    stopifnot(saved() == 0, grepl("course", output$save_result$html))
+    try_save(pref_days = character(0))
+    stopifnot(saved() == 0, grepl("preferred day", output$save_result$html))
+    try_save(pref_band = "")
+    stopifnot(saved() == 0, grepl("time band", output$save_result$html))
+    try_save(no_blocked = FALSE)
+    stopifnot(saved() == 0, grepl("blocked-time", output$save_result$html))
+    try_save(terms = FALSE)
+    stopifnot(saved() == 0, grepl("Terms of Use", output$save_result$html),
+              nrow(DBI::dbGetQuery(con2, "SELECT * FROM consents")) == 0)
+    # all complete (with "I have no blocked times"): saved in the survey format
+    try_save()
+    r <- read_responses(con2)
+    stopifnot(nrow(r) == 1, identical(names(r), SURVEY_COLUMNS), r$block == "B",
+              blank(r$blocked), r$pref_band == "evening", r$pref_days == "Sat",
+              r$course == "DS", is.null(output$err_course$html) ||
+                !grepl("text-danger", output$err_course$html))
+    # "No preference" is a valid answer and is saved as empty
+    try_save(pref_band = "none")
+    stopifnot(blank(read_responses(con2)$pref_band))
+    # a window instead of the tick is also complete, and is saved
+    session$setInputs(b_day = "Mon", b_start = "09:00", b_end = "10:00", b_add = 1)
+    try_save(no_blocked = FALSE)
+    stopifnot(read_responses(con2)$blocked == "Mon 09:00-10:00")
   })
   # no database: email sign-in is refused, the demo login previews the row
   shiny::testServer(mod_questionnaire_server, args = list(con = NULL), {
     session$setInputs(email = "test.person@mse.ac.in", email_go = 1)
     stopifnot(is.null(current_user()), grepl("No database", output$email_msg$html))
     session$setInputs(demo = TRUE, user = "R001", login = 1)
-    do.call(session$setInputs, c(form, list(terms = TRUE, save = 1)))
+    do.call(session$setInputs, c(modifyList(form, list(block = "A")),
+                                 list(terms = TRUE, save = 1)))
     stopifnot(!is.null(last_response()), grepl("would be saved", output$save_result$html))
   })
   invisible(TRUE)
@@ -581,16 +813,25 @@ mod_questionnaire_ui <- function(id) {
           card_header("Questionnaire"),
           uiOutput(ns("identity")),
           div(class = "d-flex flex-wrap gap-3 align-items-start",
-              selectInput(ns("course"), "Course", choices = q_courses(),
-                          selectize = FALSE, width = "10rem"),
-              selectInput(ns("program"), "Program", choices = prog_labels,
-                          selectize = FALSE, width = "11rem"),
-              selectInput(ns("pref_band"), "Time band (optional)",
-                          choices = c("No preference" = "", cfg$bands),
-                          selectize = FALSE, width = "12rem")),
+              div(selectInput(ns("block"), "Block",
+                              choices = c("Choose your block" = "", q_blocks()),
+                              selectize = FALSE, width = "13rem"),
+                  uiOutput(ns("err_block"))),
+              div(selectInput(ns("course"), "Course",
+                              choices = c("Choose your course" = "", q_courses()),
+                              selectize = FALSE, width = "12rem"),
+                  uiOutput(ns("err_course"))),
+              div(selectInput(ns("program"), "Program", choices = prog_labels,
+                              selectize = FALSE, width = "11rem")),
+              div(selectInput(ns("pref_band"), "Time band",
+                              choices = c("Choose a time band" = "",
+                                          "No preference" = BAND_NONE, cfg$bands),
+                              selectize = FALSE, width = "14rem"),
+                  uiOutput(ns("err_pref_band")))),
           div(class = "q-days",
-              checkboxGroupInput(ns("pref_days"), "Preferred days (optional)",
+              checkboxGroupInput(ns("pref_days"), "Preferred days",
                                  choices = cfg$days, inline = TRUE)),
+          uiOutput(ns("err_pref_days")),
           tags$hr(class = "my-2"),
           h6("Blocked times (when you are definitely unavailable, including sleep)"),
           p(class = "text-muted small mb-2",
@@ -604,6 +845,10 @@ mod_questionnaire_ui <- function(id) {
                           selected = "17:00", selectize = FALSE, width = "7rem"),
               div(class = "mb-3", actionButton(ns("b_add"), "Add window"))),
           div(class = "d-flex flex-wrap gap-3 align-items-end",
+              conditionalPanel(
+                "!input.sleep_same", ns = ns,
+                selectInput(ns("sleep_day"), "Sleep day", choices = cfg$days,
+                            selectize = FALSE, width = "7rem")),
               selectInput(ns("sleep_from"), "Sleep from", choices = times[-length(times)],
                           selected = "23:00", selectize = FALSE, width = "8rem"),
               selectInput(ns("sleep_to"), "Sleep to", choices = times[-1],
@@ -611,14 +856,19 @@ mod_questionnaire_ui <- function(id) {
               div(class = "mb-3",
                   actionButton(ns("b_sleep"), "Add sleep to every day",
                                class = "btn-outline-secondary"))),
+          checkboxInput(ns("sleep_same"), "Sleep cycle same for each day",
+                        value = TRUE),
           uiOutput(ns("b_list")),
+          checkboxInput(ns("no_blocked"), "I have no blocked times", value = FALSE),
+          uiOutput(ns("err_blocked")),
           uiOutput(ns("b_warning")),
           tags$hr(class = "my-2"),
           div(class = "d-flex flex-wrap column-gap-3 align-items-baseline",
               checkboxInput(ns("terms"), CONSENT_LABEL, value = FALSE, width = "auto"),
               actionLink(ns("show_terms"), "Read the Terms of Use")),
+          uiOutput(ns("err_terms")),
           actionButton(ns("save"), "Save response", class = "btn-primary",
-                       disabled = NA),
+                       disabled = TRUE),
           uiOutput(ns("save_result"))
         )
       )
@@ -629,6 +879,7 @@ mod_questionnaire_ui <- function(id) {
 mod_questionnaire_server <- function(id, con = NULL) {
   moduleServer(id, function(input, output, session) {
     cfg <- q_config()
+    blocks <- q_blocks(con)  # config machines, else the residents table
     residents <- q_residents()  # sample residents, for the demo login
     resident <- reactiveVal(NULL)  # one row: resident_id, name, email, block
     current_user <- reactiveVal(NULL)  # resident_id
@@ -638,6 +889,12 @@ mod_questionnaire_server <- function(id, con = NULL) {
     save_msg <- reactiveVal(NULL)
     email_msg <- reactiveVal(NULL)
     prefill_from <- reactiveVal("none")
+
+    # The dropdown is built from the config; if that lists no blocks, from residents.
+    if (!identical(blocks, q_blocks(NULL))) {
+      updateSelectInput(session, "block",
+                        choices = c("Choose your block" = "", blocks), selected = "")
+    }
 
     output$signed_in <- reactive(!is.null(current_user()))
     outputOptions(output, "signed_in", suspendWhenHidden = FALSE)
@@ -649,12 +906,12 @@ mod_questionnaire_server <- function(id, con = NULL) {
              if (prefill_from() == "saved") " Form filled from your saved response.")
     })
 
-    # Name and block come from the residents row and are not editable.
+    # The name comes from the residents row and is not editable. The block is
+    # chosen below and must match the block in that row.
     output$identity <- renderUI({
       req(resident())
-      div(class = "d-flex flex-wrap gap-5 mb-3",
-          div(div(class = "text-muted small", "Name"), strong(resident()$name)),
-          div(div(class = "text-muted small", "Block"), strong(resident()$block)))
+      div(class = "mb-3",
+          div(class = "text-muted small", "Name"), strong(resident()$name))
     })
 
     get_col <- function(row, col, default = "") {
@@ -669,11 +926,15 @@ mod_questionnaire_server <- function(id, con = NULL) {
       if (get_col(r, "program") %in% names(cfg$programs)) {
         updateSelectInput(session, "program", selected = r$program)
       }
+      # a saved empty band was the answer "No preference"
+      b <- get_col(r, "pref_band")
       updateSelectInput(session, "pref_band",
-                        selected = get_col(r, "pref_band"))
+                        selected = if (nzchar(b)) b else BAND_NONE)
       pd <- strsplit(get_col(r, "pref_days"), ";", fixed = TRUE)[[1]]
       updateCheckboxGroupInput(session, "pref_days", selected = pd)
-      blocked(parse_windows(get_col(r, "blocked")))
+      w <- parse_windows(get_col(r, "blocked"))
+      blocked(w)
+      updateCheckboxInput(session, "no_blocked", value = nrow(w) == 0)
     }
 
     sign_out <- function() {
@@ -702,7 +963,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
         return(email_error(paste("This email is not on the participant list.",
                                  "Please check the address or contact the project team.")))
       }
-      if (!found$block[1] %in% cfg$blocks) {
+      if (!found$block[1] %in% blocks) {
         sign_out()
         return(email_error(paste0("Your block (", found$block[1],
                                   ") is not set up. Please contact the project team.")))
@@ -710,6 +971,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
       email_msg(NULL)
       resident(found[1, , drop = FALSE])
       current_user(found$resident_id[1])
+      updateSelectInput(session, "block", selected = "")  # chosen again each time
       login_kind("email")
       r <- saved_response(con, found$resident_id[1])
       prefill_from(if (is.null(r)) "none" else "saved")
@@ -724,7 +986,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
     # Demo login (testing only): a sample resident from the fake survey.
     observeEvent(input$login, {
       s <- residents[residents$resident_id == input$user, , drop = FALSE]
-      if (nrow(s) == 0 || !get_col(s, "block") %in% cfg$blocks) {
+      if (nrow(s) == 0 || !get_col(s, "block") %in% blocks) {
         sign_out()
         return(email_error("That sample resident's block is not set up."))
       }
@@ -734,6 +996,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
                           email = NA_character_, block = s$block,
                           stringsAsFactors = FALSE))
       current_user(s$resident_id)
+      updateSelectInput(session, "block", selected = "")
       login_kind("demo")
       r <- saved_response(con, input$user)
       prefill_from(if (is.null(r)) "sample" else "saved")
@@ -746,9 +1009,27 @@ mod_questionnaire_server <- function(id, con = NULL) {
         terms_ui(), size = "l", easyClose = TRUE, footer = modalButton("Close")))
     })
 
-    # Save is only enabled once the terms are ticked.
+    # Every question is required: one red message under each missing answer,
+    # and Save stays disabled until none is left. Save checks again on the server.
+    unanswered <- reactive({
+      missing_answers(input$block, resident()$block, input$course, input$pref_days,
+                      input$pref_band, blocked(), input$no_blocked, input$terms,
+                      blocks, q_courses(), cfg$days, cfg$bands)
+    })
+    field_error <- function(name) {
+      renderUI({
+        msg <- unanswered()[[name]]
+        if (!is.null(msg)) div(class = "text-danger small mb-2", msg)
+      })
+    }
+    output$err_block <- field_error("block")
+    output$err_course <- field_error("course")
+    output$err_pref_days <- field_error("pref_days")
+    output$err_pref_band <- field_error("pref_band")
+    output$err_blocked <- field_error("blocked")
+    output$err_terms <- field_error("terms")
     observe({
-      shiny::updateActionButton(session, "save", disabled = !isTRUE(input$terms))
+      shiny::updateActionButton(session, "save", disabled = length(unanswered()) > 0)
     })
 
     observeEvent(input$b_add, {
@@ -761,23 +1042,38 @@ mod_questionnaire_server <- function(id, con = NULL) {
       if (e < s) e <- e + 1440L  # runs past midnight
       blocked(rbind(blocked(), data.frame(day = input$b_day, start = s, end = e,
                                           stringsAsFactors = FALSE)))
+      updateCheckboxInput(session, "no_blocked", value = FALSE)
     })
 
-    # Sleep from/to for every day. Adding again replaces the windows of the
-    # pair added before in this session, so there are no duplicates. A pair
-    # loaded from a saved response is not known, so only an identical pair is
-    # not doubled; remove the old windows below if the times changed.
-    sleep_pair <- reactiveVal(NULL)
+    # Sleep day / from / to, like the blocked-time row. "Sleep cycle same for
+    # each day" (ticked by default) adds the times to all days at once; unticked,
+    # the chosen Sleep day gets its own times. Adding again replaces the sleep
+    # added before on those days only, so there are no duplicates. Sleep loaded
+    # from a saved response is not known, so only an identical window is not
+    # doubled; remove the old windows below if the times changed.
+    sleep_added <- reactiveVal(empty_windows())
+    sleep_same <- reactive(!identical(input$sleep_same, FALSE))
+    sleep_days <- reactive({
+      if (sleep_same()) cfg$days else cfg$days[cfg$days %in% input$sleep_day]
+    })
+    observe({
+      updateActionButton(session, "b_sleep", label = if (sleep_same()) {
+        "Add sleep to every day"
+      } else paste("Add sleep to", if (length(sleep_days())) sleep_days() else "day"))
+    })
     observeEvent(input$b_sleep, {
+      if (length(sleep_days()) == 0) return()
       r <- tryCatch(add_sleep(blocked(), input$sleep_from, input$sleep_to,
-                              cfg$days, sleep_pair()),
+                              sleep_days(), sleep_added()),
                     error = function(e) e)
       if (inherits(r, "error")) {
         showNotification(conditionMessage(r), type = "error")
         return()
       }
       blocked(r$windows)
-      sleep_pair(r$pair)
+      old <- sleep_added()
+      sleep_added(rbind(old[!old$day %in% sleep_days(), , drop = FALSE], r$sleep))
+      updateCheckboxInput(session, "no_blocked", value = FALSE)
     })
 
     # Every window is listed so that any one can be removed.
@@ -806,7 +1102,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
     })
     observeEvent(input$b_clear, {
       blocked(empty_windows())
-      sleep_pair(NULL)
+      sleep_added(empty_windows())
     })
 
     output$b_warning <- renderUI({
@@ -829,15 +1125,15 @@ mod_questionnaire_server <- function(id, con = NULL) {
         return(refuse(paste0("Please enter your ", EMAIL_DOMAIN,
                              " email and press Continue first.")))
       }
-      if (!isTRUE(input$terms)) {
-        return(refuse(paste("You must agree to the Terms of Use and the data",
-                            "policy before submitting.")))
+      todo <- unanswered()
+      if (length(todo) > 0) {
+        return(refuse(paste(unlist(todo), collapse = " ")))
       }
       demo <- identical(login_kind(), "demo")
       r <- resident()
-      row <- build_response_row(r$resident_id, r$name, r$block, input$program,
+      row <- build_response_row(r$resident_id, r$name, input$block, input$program,
                                 input$course, blocked(), input$pref_days,
-                                input$pref_band, cfg$days)
+                                band_value(input$pref_band), cfg$days)
       res <- submit_response(con, row, consent = !demo)
       if (!res$ok) {
         return(refuse(if (res$stage == "consent") {
