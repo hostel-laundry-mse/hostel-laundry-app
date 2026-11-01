@@ -797,6 +797,8 @@ mod_questionnaire_ui <- function(id) {
       .q-form p, .q-form h6 { margin-bottom: 0; }
       .q-form h6 + p { margin-top: .25rem; }
       /* rows of fields: wrap on narrow windows, buttons level with the selects */
+      .q-hide-empty:empty { display: none; }
+      .q-row .shiny-input-container { margin-bottom: 0; }
       .q-row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end; }
       .q-row .form-control, .q-row .form-select, .q-row .btn { height: 2.5rem; }
       .q-row .btn { padding-top: 0; padding-bottom: 0; }
@@ -806,12 +808,11 @@ mod_questionnaire_ui <- function(id) {
       card(
         fill = FALSE,
         card_header("Sign in"),
-        div(class = "d-flex flex-wrap gap-3 align-items-start",
+        div(class = "q-row",
             textInput(ns("email"), "Your @mse.ac.in email",
                       placeholder = paste0("name@", EMAIL_DOMAIN), width = "20rem"),
-            div(style = "margin-top: 32px;",
-                actionButton(ns("email_go"), "Continue"))),
-        uiOutput(ns("email_msg")),
+            actionButton(ns("email_go"), "Continue")),
+        uiOutput(ns("email_msg"), class = "q-hide-empty"),
         checkboxInput(ns("demo"), "Demo login (testing only)", value = FALSE),
         conditionalPanel(
           "input.demo", ns = ns,
