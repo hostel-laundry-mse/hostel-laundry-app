@@ -14,7 +14,12 @@ library(readr)
 library(dplyr)
 
 ui <- page_navbar(
-  title = "Hostel Laundry",
+  title = tags$span(
+    tags$img(src = "qless-logo.png", alt = "QLess logo", height = "32px",
+             class = "me-2"),
+    "QLess"
+  ),
+  window_title = "QLess",
   theme = bs_theme(version = 5),
   nav_panel("Questionnaire", mod_questionnaire_ui("questionnaire")),
   nav_panel("My slots", mod_results_ui("my_slots", view = "mine")),
