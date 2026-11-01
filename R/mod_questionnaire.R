@@ -529,7 +529,7 @@ missing_answers <- function(block, resident_block, course, pref_days,
 test_required_fields <- function() {
   w <- parse_windows("Mon 23:00-07:00")
   none <- empty_windows()
-  courses <- c("DS", "BA")
+  courses <- c("DS", "IMA")
   bands <- c("morning", "evening")
   miss <- function(course = "DS", pref_days = "Sat", pref_band = "evening",
                    blocked = w, no_blocked = FALSE, terms = TRUE,
