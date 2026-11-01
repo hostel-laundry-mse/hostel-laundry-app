@@ -783,7 +783,23 @@ mod_questionnaire_ui <- function(id) {
     tags$style(HTML("
       .q-days .shiny-options-group { display: flex; flex-wrap: wrap; gap: .25rem 1.25rem; }
       .q-days .form-check-inline, .q-days .checkbox-inline { margin: 0; }
-      .q-days.shiny-input-container { margin-bottom: .5rem; width: auto; }
+      .q-days.shiny-input-container { width: auto; }
+      /* Questionnaire card: one wrapper, so the card's own flex gap does not add
+         space for empty outputs; even .75rem spacing between its blocks. */
+      .q-form > * { margin: 0; }
+      .q-form > * + * { margin-top: .75rem; }
+      .q-form > :empty:not(hr) { display: none; }
+      .q-form > hr { margin: .75rem 0; }
+      .q-form .shiny-input-container { margin-bottom: 0; }
+      .q-form .checkbox, .q-form .checkbox-inline,
+      .q-form .form-check, .q-form .form-check-inline { margin: 0; }
+      .q-form .shiny-html-output > * + * { margin-top: .5rem; }
+      .q-form p, .q-form h6 { margin-bottom: 0; }
+      .q-form h6 + p { margin-top: .25rem; }
+      /* rows of fields: wrap on narrow windows, buttons level with the selects */
+      .q-row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end; }
+      .q-row .form-control, .q-row .form-select, .q-row .btn { height: 2.5rem; }
+      .q-row .btn { padding-top: 0; padding-bottom: 0; }
     ")),
     layout_columns(
       fill = FALSE, col_widths = c(12, 12),
@@ -811,8 +827,9 @@ mod_questionnaire_ui <- function(id) {
         card(
           fill = FALSE,
           card_header("Questionnaire"),
+          div(class = "q-form",
           uiOutput(ns("identity")),
-          div(class = "d-flex flex-wrap gap-3 align-items-start",
+          div(class = "q-row", style = "align-items: flex-start;",
               div(selectInput(ns("block"), "Block",
                               choices = c("Choose your block" = "", q_blocks()),
                               selectize = FALSE, width = "13rem"),
@@ -832,19 +849,19 @@ mod_questionnaire_ui <- function(id) {
               checkboxGroupInput(ns("pref_days"), "Preferred days",
                                  choices = cfg$days, inline = TRUE)),
           uiOutput(ns("err_pref_days")),
-          tags$hr(class = "my-2"),
+          tags$hr(),
           h6("Blocked times (when you are definitely unavailable, including sleep)"),
-          p(class = "text-muted small mb-2",
+          p(class = "text-muted small",
             "A window can run past midnight: choose a 'To' earlier than 'From'."),
-          div(class = "d-flex flex-wrap gap-3 align-items-end",
+          div(class = "q-row",
               selectInput(ns("b_day"), "Day", choices = cfg$days,
                           selectize = FALSE, width = "7rem"),
               selectInput(ns("b_start"), "From", choices = times[-length(times)],
                           selected = "09:00", selectize = FALSE, width = "7rem"),
               selectInput(ns("b_end"), "To", choices = times[-1],
                           selected = "17:00", selectize = FALSE, width = "7rem"),
-              div(class = "mb-3", actionButton(ns("b_add"), "Add window"))),
-          div(class = "d-flex flex-wrap gap-3 align-items-end",
+              actionButton(ns("b_add"), "Add window")),
+          div(class = "q-row",
               conditionalPanel(
                 "!input.sleep_same", ns = ns,
                 selectInput(ns("sleep_day"), "Sleep day", choices = cfg$days,
@@ -853,16 +870,15 @@ mod_questionnaire_ui <- function(id) {
                           selected = "23:00", selectize = FALSE, width = "8rem"),
               selectInput(ns("sleep_to"), "Sleep to", choices = times[-1],
                           selected = "07:00", selectize = FALSE, width = "8rem"),
-              div(class = "mb-3",
-                  actionButton(ns("b_sleep"), "Add sleep to every day",
-                               class = "btn-outline-secondary"))),
+              actionButton(ns("b_sleep"), "Add sleep to every day",
+                           class = "btn-outline-secondary")),
           checkboxInput(ns("sleep_same"), "Sleep cycle same for each day",
                         value = TRUE),
           uiOutput(ns("b_list")),
           checkboxInput(ns("no_blocked"), "I have no blocked times", value = FALSE),
           uiOutput(ns("err_blocked")),
           uiOutput(ns("b_warning")),
-          tags$hr(class = "my-2"),
+          tags$hr(),
           div(class = "d-flex flex-wrap column-gap-3 align-items-baseline",
               checkboxInput(ns("terms"), CONSENT_LABEL, value = FALSE, width = "auto"),
               actionLink(ns("show_terms"), "Read the Terms of Use")),
@@ -870,6 +886,7 @@ mod_questionnaire_ui <- function(id) {
           actionButton(ns("save"), "Save response", class = "btn-primary",
                        disabled = TRUE),
           uiOutput(ns("save_result"))
+          )
         )
       )
     )
@@ -910,7 +927,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
     # chosen below and must match the block in that row.
     output$identity <- renderUI({
       req(resident())
-      div(class = "mb-3",
+      div(
           div(class = "text-muted small", "Name"), strong(resident()$name))
     })
 
