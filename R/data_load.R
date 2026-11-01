@@ -50,7 +50,9 @@
 # load_participants(path)
 #   Takes: path to a CSV with columns resident_id, name, email, block.
 #   Returns: data.frame with those columns, emails in lower case. Stops unless
-#            every email ends in @mse.ac.in and IDs and emails are unique.
+#            every email ends in @mse.ac.in and IDs and emails are unique, and
+#            no ID matches SIMULATED_ID_PATTERN (S + digits, any case), which
+#            is kept for simulated residents.
 # write_residents(con, df)
 #   Replaces the whole login list with df, checked as above: anyone left out
 #   can no longer log in. Their consents, bookings and feedback are kept.
@@ -144,6 +146,8 @@
 #            run_optimiser() takes. People with none have no row.
 
 WEEKDAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+SIMULATED_ID_PATTERN <- "^[Ss][0-9]+$"
 
 load_survey <- function(path = "data/fake_survey.csv") {
   survey <- read_data_csv(path, c("resident_id", "name", "block", "program",
@@ -423,6 +427,10 @@ load_participants <- function(path = "data/participants.csv") {
   check_residents(participants[, cols], path)
 }
 
+is_simulated_id <- function(id) {
+  grepl(SIMULATED_ID_PATTERN, id)
+}
+
 # Trims and lower-cases, then stops on anything not fit to be a login list.
 check_residents <- function(df, where) {
   cols <- c("resident_id", "name", "email", "block")
@@ -433,6 +441,12 @@ check_residents <- function(df, where) {
   if (nrow(df) == 0) stop(where, ": no residents", call. = FALSE)
   df[!is.na(df) & df == ""] <- NA_character_
   require_values(df, cols, where)
+
+  reserved <- df$resident_id[is_simulated_id(df$resident_id)]
+  if (length(reserved) > 0) {
+    stop(where, ": resident_id looking like S01 is kept for simulated residents: ",
+         paste(reserved, collapse = ", "), call. = FALSE)
+  }
 
   bad <- which(!grepl("^[^@[:space:]]+@mse\\.ac\\.in$", df$email))
   if (length(bad) > 0) {
@@ -701,6 +715,13 @@ import_responses <- function(con, paths, prefer = NULL) {
         "\nChoose who wins with prefer = \"<path>\" or prefer = \"database\"."),
         call = NULL, conflicts = conflicts)
     ))
+  }
+
+  reserved <- unique(c(responses$rows$resident_id, residents$rows$resident_id))
+  reserved <- reserved[is_simulated_id(reserved)]
+  if (length(reserved) > 0) {
+    stop("Nothing imported: resident_id looking like S01 is kept for simulated ",
+         "residents: ", paste(reserved, collapse = ", "), call. = FALSE)
   }
 
   merged <- residents$rows

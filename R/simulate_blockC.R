@@ -2,20 +2,31 @@
 # the app starts, so this file only defines functions: nothing runs or is
 # written until simulate_blockC() is called.
 #
-# simulate_blockC(source_path, out_path, n, seed, blocked_from, con)
+# simulate_blockC(source_path, out_path, n, seed, blocked_from, con, others_path)
 #   Takes: source_path  - the cleaned survey CSV
 #          out_path     - where to write the survey-format CSV
-#          n            - number of residents, IDs C001, C002, ...
+#          n            - number of residents, IDs C001, C002, ... Not used when
+#                         others_path is read.
 #          seed         - passed to set.seed()
 #          blocked_from - "simulated", or "responses" to sample blocked strings
 #                         from block C rows of read_responses(con)
 #          con          - connection from db_connect(), for "responses" only
+#          others_path  - CSV of real residents with known courses (columns
+#                         resident_id, course), git-ignored. NULL or a missing
+#                         file samples n people with random courses instead.
 #   Returns: the data.frame written, invisibly, in the survey format (see
-#            CLAUDE.md). Each person copies course, program, pref_time and
+#            CLAUDE.md).
+#            With others_path: one row per file row, with its resident_id and
+#            course, name "Simulated <id>". Program, pref_time and preferred
+#            days are copied together from one block C respondent of that
+#            course, or of any course if that course has none.
+#            Without: each person copies course, program, pref_time and
 #            preferred days together from one sampled respondent. Pool: block C,
 #            year Masters Y1, course in BLOCKC_COURSES.
 #   Stops if a pref_time or course cannot be mapped, or a row fails
-#   build_response_row() or load_survey().
+#   build_response_row() or load_survey(). An others_path ID must match
+#   SIMULATED_ID_PATTERN, which real participants may not use (R/data_load.R),
+#   and its course must be in the timetable the app loads.
 #
 # Blocked strings go through parse_windows, merge_windows, days_over_limit and
 # build_response_row from R/mod_questionnaire.R, so they are saved as a form
@@ -38,13 +49,31 @@ simulate_blockC <- function(source_path = "data/Hostel_Laundry_Clean.csv",
                             out_path = "data/fake_blockC.csv", n = 25,
                             seed = 2026,
                             blocked_from = c("simulated", "responses"),
-                            con = NULL) {
+                            con = NULL,
+                            others_path = "data/blockC_others.csv") {
   blocked_from <- match.arg(blocked_from)
-  respondents <- blockc_respondents(source_path)
+  others <- blockc_others(others_path)
+  respondents <- blockc_respondents(source_path, masters_only = is.null(others))
   real_blocked <- if (blocked_from == "responses") blockc_real_blocked(con)
 
   set.seed(seed)
-  picked <- respondents[sample.int(nrow(respondents), n, replace = TRUE), ]
+  if (is.null(others)) {
+    picked <- respondents[sample.int(nrow(respondents), n, replace = TRUE), ]
+    ids <- sprintf("C%03d", seq_len(n))
+    courses <- picked$course
+    names_out <- paste(BLOCKC_FIRST_NAMES[(seq_len(n) - 1) %% length(BLOCKC_FIRST_NAMES) + 1],
+                       BLOCKC_LAST_NAMES[(seq_len(n) - 1) %% length(BLOCKC_LAST_NAMES) + 1])
+  } else {
+    n <- nrow(others)
+    picked <- do.call(rbind, lapply(others$course, function(course) {
+      same_course <- which(respondents$course == course)
+      if (length(same_course) == 0) same_course <- seq_len(nrow(respondents))
+      respondents[same_course[sample.int(length(same_course), 1)], ]
+    }))
+    ids <- others$resident_id
+    courses <- others$course
+    names_out <- paste("Simulated", ids)
+  }
 
   rows <- lapply(seq_len(n), function(i) {
     p <- picked[i, ]
@@ -59,12 +88,11 @@ simulate_blockC <- function(source_path = "data/Hostel_Laundry_Clean.csv",
       stop("Blocked times over the limit for resident ", i, call. = FALSE)
     }
     build_response_row(
-      resident_id = sprintf("C%03d", i),
-      name = paste(BLOCKC_FIRST_NAMES[(i - 1) %% length(BLOCKC_FIRST_NAMES) + 1],
-                   BLOCKC_LAST_NAMES[(i - 1) %% length(BLOCKC_LAST_NAMES) + 1]),
+      resident_id = ids[i],
+      name = names_out[i],
       block = "C",
       program = if (p$wash_program == "Quick Wash") "quick" else "normal",
-      course = p$course,
+      course = courses[i],
       blocked = merged,
       pref_days = WEEKDAYS[unlist(p[paste0("day_", tolower(WEEKDAYS))]) == 1],
       pref_band = band
@@ -77,11 +105,41 @@ simulate_blockC <- function(source_path = "data/Hostel_Laundry_Clean.csv",
   invisible(residents)
 }
 
-blockc_respondents <- function(path) {
+# The checked rows of others_path, or NULL if there is no such file.
+blockc_others <- function(path) {
+  if (is.null(path)) return(NULL)
+  if (!file.exists(path)) {
+    message(path, " not found: sampling residents with random courses")
+    return(NULL)
+  }
+  others <- read_data_csv(path, c("resident_id", "course"))
+  if (nrow(others) == 0) stop(path, ": no residents", call. = FALSE)
+  require_values(others, c("resident_id", "course"), path)
+  bad_ids <- others$resident_id[!is_simulated_id(others$resident_id)]
+  if (length(bad_ids) > 0) {
+    stop(path, ": resident_id must look like S01, got: ",
+         paste(bad_ids, collapse = ", "), call. = FALSE)
+  }
+  repeats <- unique(others$resident_id[duplicated(others$resident_id)])
+  if (length(repeats) > 0) {
+    stop(path, ": resident_id must be unique, repeated: ",
+         paste(repeats, collapse = ", "), call. = FALSE)
+  }
+  unknown <- setdiff(others$course, load_timetable(PATH_TIMETABLE)$course)
+  if (length(unknown) > 0) {
+    stop(path, ": course not in ", PATH_TIMETABLE, ": ",
+         paste(unknown, collapse = ", "), call. = FALSE)
+  }
+  others
+}
+
+blockc_respondents <- function(path, masters_only = TRUE) {
   data <- read_data_csv(path, c("course", "year", "block", "wash_program",
                                 "pref_time", paste0("day_", tolower(WEEKDAYS))))
-  pool <- data[data$block == "C" & data$year == "Masters Y1" &
-                 data$course %in% BLOCKC_COURSES, ]
+  pool <- data[data$block == "C", ]
+  if (masters_only) {
+    pool <- pool[pool$year == "Masters Y1" & pool$course %in% BLOCKC_COURSES, ]
+  }
   if (nrow(pool) == 0) stop(path, ": no respondents to sample from", call. = FALSE)
   unmapped <- setdiff(pool$pref_time, names(BLOCKC_BANDS))
   if (length(unmapped) > 0) {
