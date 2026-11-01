@@ -83,7 +83,9 @@ TERMS <- list(
     "We collect your name, block, course, blocked times and preferences only to build and evaluate the laundry schedule, as part of a statistics course project.",
     "Only the project team and the course instructor can see it. It is not shared elsewhere, and results are reported in aggregate without identifying you.",
     "Taking part is voluntary. You can ask for your answers to be removed at any time.")),
-  list(title = "8. Other", bullets = c(
+  list(title = "8. Data Policy", bullets = c(
+    "Data will be deleted at the end of each academic year.")),
+  list(title = "9. Other", bullets = c(
     "This is a pilot. The schedule may change if machines are unavailable or rules are updated, and the team will tell residents when that happens."))
 )
 
@@ -306,25 +308,30 @@ test_blocked_helpers <- function() {
   invisible(TRUE)
 }
 
-# Sleep: one blocked window per day with the chosen times. `to` earlier than
-# `from` is the normal overnight case (it counts towards the start day, like
-# any window past midnight). Windows from an earlier sleep pair (`previous`,
-# c(start, end) in minutes) are replaced, and an identical window already there
-# is not added twice. Returns list(windows, pair); stops if from == to.
+# Sleep: one blocked window per chosen day (`days`) with the chosen times. `to`
+# earlier than `from` is the normal overnight case (it counts towards the start
+# day, like any window past midnight). Windows from earlier sleep (`previous`:
+# a c(start, end) pair in minutes for all `days`, or a data.frame of day, start,
+# end with each day's own earlier sleep) are replaced on those days only, and an
+# identical window already there is not added twice. Returns list(windows, pair,
+# sleep), sleep being the data.frame of the windows for `days`; stops if
+# from == to.
 add_sleep <- function(windows, from, to, days = FALLBACK_DAYS, previous = NULL) {
   s <- hhmm_to_min(from)
   e <- hhmm_to_min(to)
   if (e == s) stop("Sleep 'To' must differ from 'From'.", call. = FALSE)
   if (e < s) e <- e + 1440L
+  key <- function(w) paste(w$day, w$start, w$end)
   if (!is.null(previous)) {
-    windows <- windows[!(windows$day %in% days & windows$start == previous[1] &
-                           windows$end == previous[2]), , drop = FALSE]
+    prev <- if (is.data.frame(previous)) previous else
+      data.frame(day = days, start = previous[1], end = previous[2])
+    prev <- prev[prev$day %in% days, , drop = FALSE]
+    windows <- windows[!key(windows) %in% key(prev), , drop = FALSE]
   }
   new <- data.frame(day = days, start = s, end = e, stringsAsFactors = FALSE)
-  key <- function(w) paste(w$day, w$start, w$end)
   windows <- rbind(windows, new[!key(new) %in% key(windows), , drop = FALSE])
   rownames(windows) <- NULL
-  list(windows = windows, pair = c(s, e))
+  list(windows = windows, pair = c(s, e), sleep = new)
 }
 
 test_sleep_windows <- function() {
@@ -359,6 +366,14 @@ test_sleep_windows <- function() {
                      previous = r$pair)
   stopifnot(nrow(mixed$windows) == 8, "Mon 09:00-10:30" %in%
               strsplit(format_windows(mixed$windows, days), ";")[[1]])
+  # a subset of days, with each day's own earlier sleep replaced separately
+  wk <- add_sleep(empty_windows(), "22:30", "06:30", days[1:5])
+  we <- add_sleep(wk$windows, "00:00", "09:00", days[6:7])
+  stopifnot(nrow(we$windows) == 7, identical(we$sleep$day, c("Sat", "Sun")))
+  tracked <- rbind(wk$sleep, we$sleep)
+  fri <- add_sleep(we$windows, "23:30", "07:30", "Fri", previous = tracked)
+  stopifnot(nrow(fri$windows) == 7, fri$windows$start[fri$windows$day == "Fri"] == 1410L,
+            sum(fri$windows$start == 1350L) == 4, sum(fri$windows$start == 0L) == 2)
   # bad pair
   stopifnot(inherits(tryCatch(add_sleep(empty_windows(), "07:00", "07:00", days),
                               error = function(e) e), "error"))
@@ -371,7 +386,8 @@ test_sleep_windows <- function() {
   shiny::testServer(mod_questionnaire_server, args = list(con = NULL), {
     session$setInputs(demo = TRUE, user = "R001", login = 1)
     blocked(empty_windows())
-    session$setInputs(sleep_from = "23:00", sleep_to = "07:00", b_sleep = 1)
+    session$setInputs(sleep_days = FALLBACK_DAYS, sleep_from = "23:00",
+                      sleep_to = "07:00", b_sleep = 1)
     stopifnot(nrow(blocked()) == 7)
     session$setInputs(sleep_from = "22:30", sleep_to = "06:30", b_sleep = 2)
     stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1350L))   # replaced
@@ -383,6 +399,28 @@ test_sleep_windows <- function() {
     stopifnot(nrow(saved) == 6, all(saved$start == 1350L), all(saved$end == 1830L))
     session$setInputs(sleep_from = "23:00", sleep_to = "07:00", b_sleep = 3)
     stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1380L))    # Wed is back
+    # "same for each day" unticked: one Sleep day at a time, each with its own times
+    session$setInputs(b_clear = 1)
+    session$setInputs(sleep_same = FALSE, sleep_day = "Mon", sleep_from = "22:30",
+                      sleep_to = "06:30", b_sleep = 4)
+    stopifnot(nrow(blocked()) == 1, blocked()$day == "Mon")
+    session$setInputs(sleep_day = "Sat", sleep_from = "00:00", sleep_to = "09:00",
+                      b_sleep = 5)
+    session$setInputs(sleep_day = "Tue", sleep_from = "22:30", sleep_to = "06:30",
+                      b_sleep = 6)
+    w <- blocked()
+    stopifnot(nrow(w) == 3, w$start[w$day == "Sat"] == 0L,
+              w$end[w$day == "Sat"] == 540L, w$start[w$day == "Mon"] == 1350L)
+    # change only Monday: replaced, the other days keep their own times
+    session$setInputs(sleep_day = "Mon", sleep_from = "23:30", sleep_to = "07:30",
+                      b_sleep = 7)
+    w <- blocked()
+    stopifnot(nrow(w) == 3, w$start[w$day == "Mon"] == 1410L,
+              w$start[w$day == "Tue"] == 1350L, w$start[w$day == "Sat"] == 0L)
+    # ticked again: all seven days at once, replacing the earlier sleep
+    session$setInputs(sleep_same = TRUE, sleep_from = "23:00", sleep_to = "07:00",
+                      b_sleep = 8)
+    stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1380L))
   })
   invisible(TRUE)
 }
@@ -777,7 +815,7 @@ mod_questionnaire_ui <- function(id) {
           div(class = "d-flex flex-wrap gap-3 align-items-start",
               div(selectInput(ns("block"), "Block",
                               choices = c("Choose your block" = "", q_blocks()),
-                              selectize = FALSE, width = "11rem"),
+                              selectize = FALSE, width = "13rem"),
                   uiOutput(ns("err_block"))),
               div(selectInput(ns("course"), "Course",
                               choices = c("Choose your course" = "", q_courses()),
@@ -807,6 +845,10 @@ mod_questionnaire_ui <- function(id) {
                           selected = "17:00", selectize = FALSE, width = "7rem"),
               div(class = "mb-3", actionButton(ns("b_add"), "Add window"))),
           div(class = "d-flex flex-wrap gap-3 align-items-end",
+              conditionalPanel(
+                "!input.sleep_same", ns = ns,
+                selectInput(ns("sleep_day"), "Sleep day", choices = cfg$days,
+                            selectize = FALSE, width = "7rem")),
               selectInput(ns("sleep_from"), "Sleep from", choices = times[-length(times)],
                           selected = "23:00", selectize = FALSE, width = "8rem"),
               selectInput(ns("sleep_to"), "Sleep to", choices = times[-1],
@@ -814,6 +856,8 @@ mod_questionnaire_ui <- function(id) {
               div(class = "mb-3",
                   actionButton(ns("b_sleep"), "Add sleep to every day",
                                class = "btn-outline-secondary"))),
+          checkboxInput(ns("sleep_same"), "Sleep cycle same for each day",
+                        value = TRUE),
           uiOutput(ns("b_list")),
           checkboxInput(ns("no_blocked"), "I have no blocked times", value = FALSE),
           uiOutput(ns("err_blocked")),
@@ -1001,21 +1045,34 @@ mod_questionnaire_server <- function(id, con = NULL) {
       updateCheckboxInput(session, "no_blocked", value = FALSE)
     })
 
-    # Sleep from/to for every day. Adding again replaces the windows of the
-    # pair added before in this session, so there are no duplicates. A pair
-    # loaded from a saved response is not known, so only an identical pair is
-    # not doubled; remove the old windows below if the times changed.
-    sleep_pair <- reactiveVal(NULL)
+    # Sleep day / from / to, like the blocked-time row. "Sleep cycle same for
+    # each day" (ticked by default) adds the times to all days at once; unticked,
+    # the chosen Sleep day gets its own times. Adding again replaces the sleep
+    # added before on those days only, so there are no duplicates. Sleep loaded
+    # from a saved response is not known, so only an identical window is not
+    # doubled; remove the old windows below if the times changed.
+    sleep_added <- reactiveVal(empty_windows())
+    sleep_same <- reactive(!identical(input$sleep_same, FALSE))
+    sleep_days <- reactive({
+      if (sleep_same()) cfg$days else cfg$days[cfg$days %in% input$sleep_day]
+    })
+    observe({
+      updateActionButton(session, "b_sleep", label = if (sleep_same()) {
+        "Add sleep to every day"
+      } else paste("Add sleep to", if (length(sleep_days())) sleep_days() else "day"))
+    })
     observeEvent(input$b_sleep, {
+      if (length(sleep_days()) == 0) return()
       r <- tryCatch(add_sleep(blocked(), input$sleep_from, input$sleep_to,
-                              cfg$days, sleep_pair()),
+                              sleep_days(), sleep_added()),
                     error = function(e) e)
       if (inherits(r, "error")) {
         showNotification(conditionMessage(r), type = "error")
         return()
       }
       blocked(r$windows)
-      sleep_pair(r$pair)
+      old <- sleep_added()
+      sleep_added(rbind(old[!old$day %in% sleep_days(), , drop = FALSE], r$sleep))
       updateCheckboxInput(session, "no_blocked", value = FALSE)
     })
 
@@ -1045,7 +1102,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
     })
     observeEvent(input$b_clear, {
       blocked(empty_windows())
-      sleep_pair(NULL)
+      sleep_added(empty_windows())
     })
 
     output$b_warning <- renderUI({
