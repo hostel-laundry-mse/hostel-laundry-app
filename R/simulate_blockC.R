@@ -21,7 +21,7 @@
 # build_response_row from R/mod_questionnaire.R, so they are saved as a form
 # submission would save them.
 
-BLOCKC_COURSES <- c("DS", "MBA", "FE", "AQF", "EE", "AE", "GE")
+BLOCKC_COURSES <- c("DS", "MBA", "FE", "AQF", "EE", "AE", "GE", "IMA")
 
 BLOCKC_BANDS <- c("12 PM - 4 PM" = "afternoon", "4 PM - 8 PM" = "evening",
                   "8 PM - 12 AM" = "evening", "12 AM - 4 AM" = "night")
