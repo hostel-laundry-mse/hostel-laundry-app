@@ -59,6 +59,9 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
   bookings$end_min <- checker_minutes(bookings$end)
   readable <- !is.na(bookings$day) & !is.na(bookings$start_min) &
     !is.na(bookings$end_min)
+  # An end at or before the start runs past midnight, so past closing time.
+  past_midnight <- readable & bookings$end_min <= bookings$start_min
+  bookings$end_min[past_midnight] <- bookings$end_min[past_midnight] + 1440
   # The time the machine is held: the wash plus buffer, up to a whole block.
   bookings$held_until <- bookings$start_min + grid_min *
     ceiling((bookings$end_min - bookings$start_min + buffer) / grid_min)
@@ -119,6 +122,11 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
     } else if (b$start_min < open_min || b$end_min > close_min) {
       add("hours", b, paste0(label, " is outside opening hours ",
                              config$hours$open, "-", config$hours$close))
+    } else if (b$held_until > close_min) {
+      # As the optimiser and resident pages: the buffer must fit before closing.
+      add("hours", b, paste0(label, " holds the machine until ",
+                             format_hhmm(b$held_until %% 1440), " with its buffer, past closing at ",
+                             config$hours$close))
     }
 
     if ((b$start_min - open_min) %% grid_min != 0) {

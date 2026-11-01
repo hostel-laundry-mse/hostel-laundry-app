@@ -5,8 +5,8 @@ machines,C,1
 machines,D,2
 program,quick,30
 program,normal,60
-hours,open,07:00
-hours,close,23:00
+hours,open,00:00
+hours,close,24:00
 hours,days,Mon;Tue;Wed;Thu;Fri;Sat;Sun
 hours,buffer_min,10
 rules,grid_min,30
@@ -25,4 +25,5 @@ rules,reserve_share,0.1
 rules,peak_target,120
 band,morning,07:00-12:00
 band,afternoon,12:00-17:00
-band,evening,17:00-23:00
+band,evening,17:00-24:00
+band,night,00:00-07:00
