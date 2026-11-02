@@ -9,6 +9,10 @@ hours,open,00:00
 hours,close,24:00
 hours,days,Mon;Tue;Wed;Thu;Fri;Sat;Sun
 hours,buffer_min,10
+hours,normal_start,14:00
+hours,normal_end,23:00
+hours,odd_start,00:00
+hours,odd_end,07:00
 rules,grid_min,30
 rules,cycle_days,10
 rules,slots_per_cycle,2
@@ -17,6 +21,10 @@ rules,gap_max_days,5
 rules,second_slot_min_day,6
 rules,lecture_margin_min,30
 rules,max_blocked_hours,10
+rules,blocked_buffer_before_min,30
+rules,blocked_buffer_after_min,30
+rules,odd_penalty_real,8
+rules,odd_penalty_simulated,2
 rules,cancel_cutoff_hours,6
 rules,max_cancellations,3
 rules,max_no_shows,2

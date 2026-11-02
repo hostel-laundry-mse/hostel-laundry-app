@@ -25,10 +25,20 @@
 #            skipped), unknown_person, wrong_block, no_such_machine,
 #            out_of_order, hours, grid, duration, out_of_cycle, lecture, margin
 #            (inside a lecture's margin but not the lecture), blocked,
-#            double_booking, buffer_overlap, slot_count, gap_short, gap_long,
-#            second_before_day6, cross_too_soon, cross_too_late.
+#            blocked_margin (inside a blocked time's buffer but not the blocked
+#            time), double_booking, buffer_overlap, slot_count, gap_short,
+#            gap_long, second_before_day6, cross_too_soon, cross_too_late.
+#            A simulated resident (is_simulated_id()) short of slots is not a
+#            problem: see check_schedule_info().
 #   Not checked: the emergency reserve, peak target, check-ins, changes and the
 #            10-hour blocked limit.
+#
+# check_schedule_info(schedule, survey, config, slots_lost = NULL)
+#   Takes: the same inputs as check_schedule().
+#   Returns: data.frame of soft misses that do not make a schedule invalid, with
+#            columns kind, person, machine, date, row, message. Kinds:
+#            outside_normal_hours, odd_hours, simulated_short. machine, date and
+#            row are NA for simulated_short.
 
 check_schedule <- function(schedule, survey, config, timetable = load_timetable(),
                            cycle_start = NULL, last_planned = NULL,
@@ -171,10 +181,15 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
     }
 
     blocked <- parse_blocked(resident$blocked, resident$resident_id)
+    widened <- widen_blocked(blocked, config)
+    widened <- widened[widened$day == weekday, ]
     blocked <- blocked[blocked$day == weekday, ]
     if (any(b$start_min < blocked$end & blocked$start < b$end_min)) {
       add("blocked", b, paste0(label, " is during ", b$person,
                                "'s blocked time"))
+    } else if (any(b$start_min < widened$end & widened$start < b$end_min)) {
+      add("blocked_margin", b, paste0(label, " is inside the buffer around ",
+                                      b$person, "'s blocked time"))
     }
   }
 
@@ -206,7 +221,7 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
       sum(slots_lost$slots_lost[slots_lost$resident_id == person])
     }
     allowed <- max(slots - lost, 0)
-    if (n_booked != allowed) {
+    if (n_booked > allowed || (n_booked < allowed && !is_simulated_id(person))) {
       add_person("slot_count", person, paste0(person, " has ", n_booked,
                                               " booking(s), not ", allowed))
     }
@@ -260,6 +275,63 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
   problems <- problems[order(problems$row, problems$person, problems$rule), ]
   rownames(problems) <- NULL
   problems
+}
+
+check_schedule_info <- function(schedule, survey, config, slots_lost = NULL) {
+  require_columns(schedule, c("person", "machine", "date", "start", "end"),
+                  "check_schedule_info()")
+  hour_setting <- function(name, default) {
+    x <- config$hours[[name]]
+    parse_hhmm(if (is.null(x)) default else x, paste0("hours,", name))
+  }
+  normal_start <- hour_setting("normal_start", "14:00")
+  normal_end <- hour_setting("normal_end", "23:00")
+  odd_start <- hour_setting("odd_start", "00:00")
+  odd_end <- hour_setting("odd_end", "07:00")
+  slots <- if (is.null(config$rules$slots_per_cycle)) 2 else config$rules$slots_per_cycle
+
+  found <- list()
+  add <- function(kind, person, machine, date, row, message) {
+    found[[length(found) + 1]] <<- data.frame(
+      kind = kind, person = person, machine = machine, date = date, row = row,
+      message = message
+    )
+  }
+
+  start_min <- checker_minutes(schedule$start)
+  end_min <- checker_minutes(schedule$end)
+  for (i in seq_len(nrow(schedule))) {
+    if (is.na(start_min[i]) || is.na(end_min[i])) next
+    label <- paste0(schedule$person[i], " ", schedule$date[i], " ",
+                    schedule$start[i], "-", schedule$end[i])
+    if (start_min[i] < normal_start || end_min[i] > normal_end) {
+      add("outside_normal_hours", schedule$person[i], schedule$machine[i],
+          schedule$date[i], i, paste0(label, " is outside normal hours"))
+    }
+    if (start_min[i] < odd_end && odd_start < end_min[i]) {
+      add("odd_hours", schedule$person[i], schedule$machine[i],
+          schedule$date[i], i, paste0(label, " overlaps odd hours"))
+    }
+  }
+
+  for (person in survey$resident_id[is_simulated_id(survey$resident_id)]) {
+    lost <- if (is.null(slots_lost)) 0 else {
+      sum(slots_lost$slots_lost[slots_lost$resident_id == person])
+    }
+    allowed <- max(slots - lost, 0)
+    n_booked <- sum(schedule$person == person)
+    if (n_booked < allowed) {
+      add("simulated_short", person, NA_character_, NA_character_, NA_integer_,
+          paste0(person, " has ", n_booked, " booking(s), not ", allowed))
+    }
+  }
+
+  empty <- data.frame(kind = character(), person = character(),
+                      machine = character(), date = character(),
+                      row = integer(), message = character())
+  info <- do.call(rbind, c(list(empty), found))
+  rownames(info) <- NULL
+  info
 }
 
 # "HH:MM" to minutes after midnight, NA if it can't be read.
