@@ -65,13 +65,17 @@ library(ROI.plugin.glpk)
 # penalties. The gap constraints in build_model() are written for at most 2.
 SLOTS_PER_CYCLE <- 2L
 
+# Preference points for a wash inside the preferred hours. A preferred weekday
+# is worth 1, so the time of day counts for more than the day.
+PREFERRED_HOURS_POINTS <- 2L
+
 # Objective weights.
-#   pref:   value of one preference point (scores are 1 or 2).
+#   pref:   value of one preference point (scores are 1 to 4).
 #   peak:   cost of one booked machine-minute above peak_target in an hour.
 #   assign: value of one booking. NULL means "set automatically" to
-#           pref * A_max + peak * A_max * longest booking minutes + 1,
+#           3 * pref * A_max + peak * A_max * longest booking minutes + 1,
 #           where A_max is the most bookings the block could get. Swapping
-#           bookings around can raise total preference by at most 1 per
+#           bookings around can raise total preference by at most 3 per
 #           booking and lower total overload by at most the booked minutes,
 #           so with this value one extra booking always beats any preference
 #           or peak gain: nobody loses a booking to improve someone else's
@@ -216,6 +220,9 @@ normalise_config <- function(config) {
     gap_max = opt(rules$gap_max_days, 5),
     reserve_share = opt(rules$reserve_share, 0),
     peak_target = opt(rules$peak_target, NA),
+    blocked_margin = opt(rules$blocked_margin_min, 30),
+    preferred_from = opt(rules$preferred_from_min, 14 * 60),
+    preferred_to = opt(rules$preferred_to_min, 23 * 60),
     out_of_order = as.character(config$out_of_order)
   )
 }
@@ -226,6 +233,7 @@ normalise_config <- function(config) {
 # block or program is not in config are marked not valid.
 prepare_people <- function(survey, cfg, grid, last_planned = NULL, slots_lost = NULL) {
   if (!"pref_days" %in% names(survey)) survey$pref_days <- NA_character_
+  if (!"blocked" %in% names(survey)) survey$blocked <- NA_character_
   lost <- data.frame(resident_id = character(), lost = numeric())
   if (!is.null(slots_lost) && nrow(slots_lost) > 0) {
     lost <- transmute(slots_lost, resident_id = as.character(resident_id),
@@ -323,9 +331,12 @@ generate_grid <- function(cfg, cycle_start) {
 #     the person's free windows, which already exclude lectures (with their
 #     margin) and blocked times. The buffer is machine time, not the
 #     person's, so it may run past the end of the window,
+#   - the wash stays blocked_margin minutes clear of the person's blocked times:
+#     nobody washes just before going to sleep or just after waking up,
 #   - it is at least gap_min days after the person's last planned booking of
 #     the previous cycle.
-# Preference score: 2 = preferred weekday, 1 = any other day the person is free.
+# Preference score: 1, plus 1 on a preferred weekday, plus
+# PREFERRED_HOURS_POINTS if the whole wash is inside the preferred hours.
 build_candidates <- function(people, free_windows, cfg, grid) {
   ok <- filter(people, valid, cap > 0, grid$working[block] > 0)
   windows <- free_windows |>
@@ -354,19 +365,56 @@ build_candidates <- function(people, free_windows, cfg, grid) {
     ) |>
     distinct()
 
-  ok |>
+  candidates <- ok |>
     select(resident_id, block, duration_min, cells, pref_days) |>
     inner_join(starts, by = "resident_id") |>
     left_join(grid$dates, by = "date") |>
     mutate(
       start_min = grid$cell_start(s),
-      end_min = start_min + duration_min,
-      score = 1L + in_day_list(weekday, pref_days)
+      end_min = start_min + duration_min
+    )
+
+  too_close <- candidates |>
+    inner_join(blocked_with_margin(ok, cfg), by = c("resident_id", "weekday"),
+               relationship = "many-to-many") |>
+    filter(start_min < to, from < end_min) |>
+    distinct(resident_id, date, s)
+
+  candidates |>
+    anti_join(too_close, by = c("resident_id", "date", "s")) |>
+    mutate(
+      in_hours = start_min >= cfg$preferred_from & end_min <= cfg$preferred_to,
+      score = 1L + in_day_list(weekday, pref_days) + PREFERRED_HOURS_POINTS * in_hours
     ) |>
     arrange(block, resident_id, day_idx, s) |>
     mutate(id = row_number()) |>
     select(id, resident_id, block, date, day_idx, s, cells, start_min,
            end_min, score)
+}
+
+# Each person's blocked times widened by blocked_margin on both sides, as
+# data.frame(resident_id, weekday, from, to) in minutes after midnight of that
+# weekday. A margin crossing midnight also covers the neighbouring weekday.
+blocked_with_margin <- function(people, cfg) {
+  m <- cfg$blocked_margin
+  neighbour <- function(day, by) WEEKDAYS[(match(day, WEEKDAYS) - 1 + by) %% 7 + 1]
+  rows <- lapply(seq_len(nrow(people)), function(i) {
+    b <- parse_blocked(people$blocked[i], people$resident_id[i])
+    if (nrow(b) == 0) return(NULL)
+    before <- b[b$start - m < 0, , drop = FALSE]
+    after <- b[b$end + m > 1440, , drop = FALSE]
+    data.frame(
+      resident_id = people$resident_id[i],
+      weekday = c(b$day, neighbour(before$day, -1), neighbour(after$day, 1)),
+      from = c(b$start - m, before$start - m + 1440, rep(0, nrow(after))),
+      to = c(b$end + m, rep(1440, nrow(before)), after$end + m - 1440)
+    )
+  })
+  bind_rows(
+    data.frame(resident_id = character(), weekday = character(),
+               from = numeric(), to = numeric()),
+    rows
+  )
 }
 
 # A person with a previous-cycle booking must have their first booking
@@ -545,7 +593,7 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
   # Objective weights; see default_weights().
   a_max <- sum(people$cap)
   assign_w <- weights$assign
-  auto_w <- weights$pref * a_max +
+  auto_w <- 3 * weights$pref * a_max +
     weights$peak * a_max * max(cand$cells) * g + 1
   if (is.null(assign_w)) {
     assign_w <- auto_w

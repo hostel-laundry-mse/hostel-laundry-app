@@ -103,7 +103,8 @@ starts (e.g. `Mon 23:30-07:30` runs into Tuesday) and counts towards that day.
 - A machine runs at most one booking at a time, buffer included.
 - Emergency reserve: on each date, each block keeps at least `reserve_share` of its machine time unbooked.
 - Busy hours above `peak_target` are avoided where possible.
-- Preferred days are honoured where possible; getting everyone a booking always comes first. There is no time-of-day preference: `pref_band` is ignored.
+- Washes inside the preferred hours (2pm to 11pm, for everyone) come first where possible, then preferred days; getting everyone a booking always comes before both. Residents don't choose a time of day: `pref_band` is ignored.
+- The optimiser keeps every wash 30 minutes clear of a person's blocked times (`Mon 23:00-07:00` means nothing from 22:30 and nothing before 07:30). Free slots and the checker don't apply this margin.
 - If someone's free time leaves no valid booking, they are listed as underserved with the reason.
 
 ## Cancellations, no-shows and free slots
@@ -188,6 +189,8 @@ optimiser takes, one row per free stretch of time:
 - `rules,gap_min_days,<days>` and `rules,gap_max_days,<days>`: days between a person's consecutive bookings (default 4 and 5)
 - `rules,lecture_margin_min,<minutes>`: unavailable time before and after each lecture (default 30)
 - `rules,max_blocked_hours,<hours>`: personal blocked time allowed per day, sleep included (default 10)
+- `rules,blocked_margin_min,<minutes>`: gap the optimiser keeps before and after blocked times (default 30)
+- `rules,preferred_from_min,<minutes>` and `rules,preferred_to_min,<minutes>`: preferred hours, as minutes after midnight (default 840 and 1380, 2pm to 11pm)
 - `rules,cancel_cutoff_hours,<hours>`: latest a slot can be cancelled before it starts (default 6)
 - `rules,max_cancellations,<n>` and `rules,max_no_shows,<n>`: how many are allowed before a slot is lost (default 3 and 2)
 - `rules,penalty_window_days,<days>`: how far back they are counted from the cycle start (default 30)
