@@ -16,6 +16,7 @@
 # survey format in CLAUDE.md:
 #   resident_id, name, block, program, course, blocked, pref_days,
 #   pref_band
+# pref_band is not asked any more and is always "No preference".
 # `blocked` is `;`-separated `Day HH:MM-HH:MM`. An end before the start runs
 # past midnight (Mon 23:00-07:00) and counts towards the day it starts on; an
 # end of 24:00 means midnight.
@@ -105,10 +106,9 @@ FALLBACK_DAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 FALLBACK_BLOCKS <- c("A", "B", "C", "D")
 FALLBACK_COURSES <- c("DS", "FE", "GE", "AE", "AQF", "EE", "MBA")
 FALLBACK_PROGRAMS <- c(quick = 30, normal = 60)
-# The time band dropdown starts on "" (not answered yet); this value is the
-# explicit answer "No preference", saved as "" (the survey format for none).
-BAND_NONE <- "none"
-FALLBACK_BANDS <- c("morning", "afternoon", "evening")
+# The time band is no longer asked (the optimiser does not use it). The saved
+# row keeps the pref_band column, always set to this value.
+NO_BAND <- "No preference"
 FALLBACK_MAX_BLOCKED_HOURS <- 10
 FALLBACK_RESIDENTS <- data.frame(
   resident_id = c("R001", "R002"), name = c("Kiran Okafor", "Noor Mehta"),
@@ -140,7 +140,7 @@ q_config <- function(path = PATH_CONFIG) {
   ok <- is.data.frame(tab) && all(c("section", "key", "value") %in% names(tab))
   if (!ok) {
     return(list(from_file = FALSE, blocks = FALLBACK_BLOCKS,
-                programs = FALLBACK_PROGRAMS, bands = FALLBACK_BANDS,
+                programs = FALLBACK_PROGRAMS,
                 days = FALLBACK_DAYS,
                 max_blocked_hours = FALLBACK_MAX_BLOCKED_HOURS))
   }
@@ -153,7 +153,6 @@ q_config <- function(path = PATH_CONFIG) {
     blocks = or(names(config_section(tab, "machines")), FALLBACK_BLOCKS),
     programs = or(setNames(as.numeric(programs), names(programs)),
                   FALLBACK_PROGRAMS),
-    bands = or(names(config_section(tab, "band")), FALLBACK_BANDS),
     days = if ("days" %in% names(hours)) {
       strsplit(hours[["days"]], ";", fixed = TRUE)[[1]]
     } else FALLBACK_DAYS,
@@ -393,7 +392,7 @@ test_sleep_windows <- function() {
     stopifnot(nrow(blocked()) == 7, all(blocked()$start == 1350L))   # replaced
     session$setInputs(b_sel = "3", b_remove = 1)                      # remove Wed only
     stopifnot(nrow(blocked()) == 6, !"Wed" %in% blocked()$day)
-    session$setInputs(block = "A", course = "DS", program = "quick", pref_band = "none",
+    session$setInputs(block = "A", course = "DS", program = "quick",
                       pref_days = "Sat", terms = TRUE, save = 1)
     saved <- parse_windows(last_response()$blocked)
     stopifnot(nrow(saved) == 6, all(saved$start == 1350L), all(saved$end == 1830L))
@@ -427,26 +426,26 @@ test_sleep_windows <- function() {
 
 # One-row survey-format data.frame built from form values.
 build_response_row <- function(resident_id, name, block, program, course,
-                               blocked, pref_days, pref_band = "",
-                               days = FALLBACK_DAYS) {
+                               blocked, pref_days, days = FALLBACK_DAYS) {
   data.frame(resident_id = resident_id, name = name, block = block,
              program = program, course = course,
              blocked = format_windows(blocked, days),
              pref_days = paste(pref_days, collapse = ";"),
-             pref_band = if (is.null(pref_band)) "" else pref_band,
+             pref_band = NO_BAND,
              stringsAsFactors = FALSE)[, SURVEY_COLUMNS]
 }
 
 test_response_row <- function() {
   row <- build_response_row("R001", "Kiran Okafor", "A", "quick", "DS",
-                            parse_windows("Mon 23:00-07:00"), c("Sat", "Sun"),
-                            "evening")
+                            parse_windows("Mon 23:00-07:00"), c("Sat", "Sun"))
   # exactly the columns of CLAUDE.md "Survey data format", in order, no room
   stopifnot(identical(names(row), c("resident_id", "name", "block", "program",
                                     "course", "blocked", "pref_days",
                                     "pref_band")))
   stopifnot(nrow(row) == 1, row$blocked == "Mon 23:00-07:00",
             row$pref_days == "Sat;Sun")
+  # the time band is not asked: the saved value is always "No preference"
+  stopifnot(identical(row$pref_band, "No preference"), identical(NO_BAND, "No preference"))
   # and the same as the header of the sample survey file
   survey <- read_csv_chr(PATH_SURVEY)
   if (is.data.frame(survey)) stopifnot(identical(names(row), names(survey)))
@@ -524,19 +523,16 @@ time_choices <- function(from = "00:00", to = "24:00", step = 30) {
 
 # ---- Required answers --------------------------------------------------------
 
-# The value saved in pref_band for a dropdown value.
-band_value <- function(x) if (is.null(x) || identical(x, BAND_NONE)) "" else x
-
 # Every question is required. Returns a named list with one message per missing
-# answer (names: block, course, pref_days, pref_band, blocked, terms); empty
+# answer (names: block, course, pref_days, blocked, terms); empty
 # when everything is complete. The block must be one of `blocks` and equal to
 # the block in the signed-in resident's row (`resident_block`). Blocked times need at least one window or the
 # explicit "I have no blocked times" tick. Used for the red messages, for the
 # Save button and again on Save, so a skipped answer is never written.
 missing_answers <- function(block, resident_block, course, pref_days,
-                            pref_band, blocked, no_blocked, terms,
+                            blocked, no_blocked, terms,
                             blocks = FALLBACK_BLOCKS, courses = q_courses(),
-                            days = FALLBACK_DAYS, bands = FALLBACK_BANDS) {
+                            days = FALLBACK_DAYS) {
   one <- function(x) length(x) == 1 && !is.na(x)
   out <- list()
   if (!(one(block) && block %in% blocks)) {
@@ -550,9 +546,6 @@ missing_answers <- function(block, resident_block, course, pref_days,
   }
   if (length(pref_days) == 0 || !all(pref_days %in% days)) {
     out$pref_days <- "Please tick at least one preferred day."
-  }
-  if (!(one(pref_band) && pref_band %in% c(BAND_NONE, bands))) {
-    out$pref_band <- "Please choose a preferred time band (or No preference)."
   }
   if (nrow(blocked) == 0 && !isTRUE(no_blocked)) {
     out$blocked <- paste("Add at least one blocked-time window, or tick",
@@ -568,19 +561,17 @@ test_required_fields <- function() {
   w <- parse_windows("Mon 23:00-07:00")
   none <- empty_windows()
   courses <- c("DS", "IMA")
-  bands <- c("morning", "evening")
-  miss <- function(course = "DS", pref_days = "Sat", pref_band = "evening",
-                   blocked = w, no_blocked = FALSE, terms = TRUE,
+  miss <- function(course = "DS", pref_days = "Sat", blocked = w, no_blocked = FALSE, terms = TRUE,
                    block = "B", resident_block = "B") {
-    names(missing_answers(block, resident_block, course, pref_days, pref_band,
+    names(missing_answers(block, resident_block, course, pref_days,
                           blocked, no_blocked, terms, c("A", "B"), courses,
-                          FALLBACK_DAYS, bands))
+                          FALLBACK_DAYS))
   }
   msg <- function(...) {
     missing_answers(..., blocked = w, no_blocked = FALSE, terms = TRUE,
-                    course = "DS", pref_days = "Sat", pref_band = "evening",
+                    course = "DS", pref_days = "Sat",
                     blocks = c("A", "B"), courses = courses,
-                    days = FALLBACK_DAYS, bands = bands)$block
+                    days = FALLBACK_DAYS)$block
   }
   # block: empty, unknown, or not the resident's own block; a match is fine
   stopifnot(identical(miss(block = ""), "block"),
@@ -593,9 +584,6 @@ test_required_fields <- function() {
                       "Your block in the participant list is B. Please select B."))
   # all complete: windows, or the explicit "no blocked times" tick
   stopifnot(length(miss()) == 0, length(miss(blocked = none, no_blocked = TRUE)) == 0)
-  # "No preference" is an answer; the saved value is empty
-  stopifnot(length(miss(pref_band = BAND_NONE)) == 0, band_value(BAND_NONE) == "",
-            band_value("evening") == "evening")
   # each missing field on its own gives exactly its own message
   stopifnot(identical(miss(course = ""), "course"),
             identical(miss(course = NULL), "course"),
@@ -603,9 +591,6 @@ test_required_fields <- function() {
             identical(miss(pref_days = NULL), "pref_days"),
             identical(miss(pref_days = character(0)), "pref_days"),
             identical(miss(pref_days = "Funday"), "pref_days"),
-            identical(miss(pref_band = ""), "pref_band"),
-            identical(miss(pref_band = NULL), "pref_band"),
-            identical(miss(pref_band = "midnight"), "pref_band"),
             identical(miss(terms = FALSE), "terms"),
             identical(miss(terms = NULL), "terms"))
   # blocked times: neither windows nor the tick is missing; the tick alone is enough
@@ -613,11 +598,10 @@ test_required_fields <- function() {
             identical(miss(blocked = none, no_blocked = FALSE), "blocked"),
             identical(miss(blocked = none, no_blocked = NULL), "blocked"),
             length(miss(blocked = none, no_blocked = TRUE)) == 0)
-  # everything missing: all five are reported
+  # everything missing: all of them are reported
   stopifnot(identical(
-    miss(block = "", course = "", pref_days = NULL, pref_band = "",
-         blocked = none, terms = FALSE),
-    c("block", "course", "pref_days", "pref_band", "blocked", "terms")))
+    miss(block = "", course = "", pref_days = NULL, blocked = none, terms = FALSE),
+    c("block", "course", "pref_days", "blocked", "terms")))
   invisible(TRUE)
 }
 
@@ -649,7 +633,7 @@ test_save_flow <- function() {
     resident_id = c("P001", "P002"), name = c("Priya Test", "Dev Test"),
     email = c("test.person@mse.ac.in", "other@mse.ac.in"), block = c("B", "D")))
   form <- list(block = "B", course = "DS", program = "quick",
-               pref_band = "evening", pref_days = "Sat", no_blocked = TRUE)
+               pref_days = "Sat", no_blocked = TRUE)
   consents <- function() DBI::dbGetQuery(con, "SELECT * FROM consents")
   shiny::testServer(mod_questionnaire_server, args = list(con = con), {
     # not signed in: nothing is saved
@@ -705,7 +689,7 @@ test_save_flow <- function() {
   db_init(con2)
   write_residents(con2, data.frame(resident_id = "P001", name = "Priya Test",
                                    email = "test.person@mse.ac.in", block = "B"))
-  full <- list(block = "B", course = "DS", program = "quick", pref_band = "evening",
+  full <- list(block = "B", course = "DS", program = "quick",
                pref_days = "Sat", no_blocked = TRUE, terms = TRUE)
   shiny::testServer(mod_questionnaire_server, args = list(con = con2), {
     session$setInputs(email = "test.person@mse.ac.in", email_go = 1)
@@ -717,9 +701,9 @@ test_save_flow <- function() {
     saved <- function() nrow(read_responses(con2))
     blank <- function(x) is.na(x) || x == ""   # read_responses() gives NA for empty
     # nothing answered yet: every field shows its message
-    session$setInputs(block = "", course = "", pref_band = "", pref_days = NULL,
+    session$setInputs(block = "", course = "", pref_days = NULL,
                       no_blocked = FALSE, terms = FALSE)
-    for (f in c("block", "course", "pref_days", "pref_band", "blocked", "terms")) {
+    for (f in c("block", "course", "pref_days", "blocked", "terms")) {
       stopifnot(grepl("text-danger", output[[paste0("err_", f)]]$html))
     }
     # block: empty, then not the block in the participant list (B), then matching
@@ -735,8 +719,6 @@ test_save_flow <- function() {
     stopifnot(saved() == 0, grepl("course", output$save_result$html))
     try_save(pref_days = character(0))
     stopifnot(saved() == 0, grepl("preferred day", output$save_result$html))
-    try_save(pref_band = "")
-    stopifnot(saved() == 0, grepl("time band", output$save_result$html))
     try_save(no_blocked = FALSE)
     stopifnot(saved() == 0, grepl("blocked-time", output$save_result$html))
     try_save(terms = FALSE)
@@ -746,12 +728,13 @@ test_save_flow <- function() {
     try_save()
     r <- read_responses(con2)
     stopifnot(nrow(r) == 1, identical(names(r), SURVEY_COLUMNS), r$block == "B",
-              blank(r$blocked), r$pref_band == "evening", r$pref_days == "Sat",
+              blank(r$blocked), r$pref_band == "No preference", r$pref_days == "Sat",
               r$course == "DS", is.null(output$err_course$html) ||
                 !grepl("text-danger", output$err_course$html))
-    # "No preference" is a valid answer and is saved as empty
-    try_save(pref_band = "none")
-    stopifnot(blank(read_responses(con2)$pref_band))
+    # the time band is never asked: a saved row has "No preference", also when
+    # the form is saved again
+    try_save(program = "normal")
+    stopifnot(identical(read_responses(con2)$pref_band, "No preference"))
     # a window instead of the tick is also complete, and is saved
     session$setInputs(b_day = "Mon", b_start = "09:00", b_end = "10:00", b_add = 1)
     try_save(no_blocked = FALSE)
@@ -840,12 +823,7 @@ mod_questionnaire_ui <- function(id) {
                               selectize = FALSE, width = "12rem"),
                   uiOutput(ns("err_course"))),
               div(selectInput(ns("program"), "Program", choices = prog_labels,
-                              selectize = FALSE, width = "11rem")),
-              div(selectInput(ns("pref_band"), "Time band",
-                              choices = c("Choose a time band" = "",
-                                          "No preference" = BAND_NONE, cfg$bands),
-                              selectize = FALSE, width = "14rem"),
-                  uiOutput(ns("err_pref_band")))),
+                              selectize = FALSE, width = "11rem"))),
           div(class = "q-days",
               checkboxGroupInput(ns("pref_days"), "Preferred days",
                                  choices = cfg$days, inline = TRUE)),
@@ -944,10 +922,6 @@ mod_questionnaire_server <- function(id, con = NULL) {
       if (get_col(r, "program") %in% names(cfg$programs)) {
         updateSelectInput(session, "program", selected = r$program)
       }
-      # a saved empty band was the answer "No preference"
-      b <- get_col(r, "pref_band")
-      updateSelectInput(session, "pref_band",
-                        selected = if (nzchar(b)) b else BAND_NONE)
       pd <- strsplit(get_col(r, "pref_days"), ";", fixed = TRUE)[[1]]
       updateCheckboxGroupInput(session, "pref_days", selected = pd)
       w <- parse_windows(get_col(r, "blocked"))
@@ -1031,8 +1005,8 @@ mod_questionnaire_server <- function(id, con = NULL) {
     # and Save stays disabled until none is left. Save checks again on the server.
     unanswered <- reactive({
       missing_answers(input$block, resident()$block, input$course, input$pref_days,
-                      input$pref_band, blocked(), input$no_blocked, input$terms,
-                      blocks, q_courses(), cfg$days, cfg$bands)
+                      blocked(), input$no_blocked, input$terms,
+                      blocks, q_courses(), cfg$days)
     })
     field_error <- function(name) {
       renderUI({
@@ -1043,7 +1017,6 @@ mod_questionnaire_server <- function(id, con = NULL) {
     output$err_block <- field_error("block")
     output$err_course <- field_error("course")
     output$err_pref_days <- field_error("pref_days")
-    output$err_pref_band <- field_error("pref_band")
     output$err_blocked <- field_error("blocked")
     output$err_terms <- field_error("terms")
     observe({
@@ -1151,7 +1124,7 @@ mod_questionnaire_server <- function(id, con = NULL) {
       r <- resident()
       row <- build_response_row(r$resident_id, r$name, input$block, input$program,
                                 input$course, blocked(), input$pref_days,
-                                band_value(input$pref_band), cfg$days)
+                                cfg$days)
       res <- submit_response(con, row, consent = !demo)
       if (!res$ok) {
         return(refuse(if (res$stage == "consent") {
