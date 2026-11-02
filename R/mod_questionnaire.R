@@ -110,6 +110,9 @@ FALLBACK_PROGRAMS <- c(quick = 30, normal = 60)
 # row keeps the pref_band column, always set to this value.
 NO_BAND <- "No preference"
 FALLBACK_MAX_BLOCKED_HOURS <- 10
+# Daily blocked-time limit on a day the course has no class (on days with a
+# class it is max_blocked_hours from the config, 10 by default).
+NO_CLASS_LIMIT_HOURS <- 12
 FALLBACK_RESIDENTS <- data.frame(
   resident_id = c("R001", "R002"), name = c("Kiran Okafor", "Noor Mehta"),
   block = c("A", "A"),
@@ -169,6 +172,52 @@ q_courses <- function(path = PATH_TIMETABLE) {
     return(unique(t$course))
   }
   FALLBACK_COURSES
+}
+
+# Weekdays on which `course` has a lecture in the timetable (columns course,
+# day, start, end; day is Mon ... Sun). NULL if the file does not load or the
+# course is not in it.
+class_days <- function(course, path = PATH_TIMETABLE) {
+  t <- read_csv_chr(path)
+  if (!is.data.frame(t) || !all(c("course", "day") %in% names(t))) return(NULL)
+  if (length(course) != 1 || is.na(course) || !course %in% t$course) return(NULL)
+  unique(t$day[t$course == course])
+}
+
+# The blocked hours allowed per day for a course: `class_limit` on days with a
+# class, `free_limit` on days without. Class time itself does not count towards
+# the blocked hours. A course that is not found gets `class_limit` on every day.
+# Returns a named numeric vector (one entry per day) whose "class_days"
+# attribute lists the class days; the attribute is missing for an unknown course.
+day_limits <- function(course, days = FALLBACK_DAYS,
+                       class_limit = FALLBACK_MAX_BLOCKED_HOURS,
+                       free_limit = NO_CLASS_LIMIT_HOURS, path = PATH_TIMETABLE) {
+  cd <- class_days(course, path)
+  if (is.null(cd)) return(setNames(rep(class_limit, length(days)), days))
+  structure(setNames(ifelse(days %in% cd, class_limit, free_limit), days),
+            class_days = cd)
+}
+
+# The limit that applies on `day`: `limit` is one number for every day, or a
+# named vector from day_limits().
+limit_on <- function(limit, day) {
+  if (!is.null(names(limit)) && day %in% names(limit)) return(limit[[day]])
+  if (length(limit) == 1 && is.null(names(limit))) return(limit)
+  FALLBACK_MAX_BLOCKED_HOURS
+}
+
+# Words for why a day has its limit, for the messages.
+limit_reason <- function(limit, day) {
+  cd <- attr(limit, "class_days")
+  if (is.null(cd)) return("per day")
+  if (day %in% cd) "on days with classes" else "on days without classes"
+}
+
+# "Mon (11 h, limit 10 h on days with classes)" for each day in `over`.
+over_text <- function(over, limit) {
+  paste0(names(over), " (", round(over, 1), " h, limit ", vapply(
+    names(over), function(d) limit_on(limit, d), 1), " h ", vapply(
+    names(over), function(d) limit_reason(limit, d), ""), ")", collapse = ", ")
 }
 
 # Blocks for the Block dropdown: the machines keys of data/config.csv; if the
@@ -273,9 +322,12 @@ hours_per_day <- function(w) {
   tot[unique(m$day)]
 }
 
+# `limit` is one number for every day (the default), or a named vector with a
+# limit per day (see day_limits()).
 days_over_limit <- function(w, limit = FALLBACK_MAX_BLOCKED_HOURS) {
   h <- hours_per_day(w)
-  h[h > limit]
+  lim <- vapply(names(h), function(d) limit_on(limit, d), 1)
+  h[h > lim]
 }
 
 test_blocked_helpers <- function() {
@@ -305,6 +357,35 @@ test_blocked_helpers <- function() {
   over <- days_over_limit(parse_windows("Fri 20:00-24:00;Fri 00:00-07:00"), 10)
   stopifnot(over[["Fri"]] == 11)                             # separate windows add up
   invisible(TRUE)
+}
+
+# One blocked window from the "Add window" row. Windows on the same day that
+# overlap or touch are merged into one; separate ones are all kept. A window
+# is refused (nothing added, a message returned) if From equals To, or if it
+# would take that day over its blocked-hours limit (`limit`: one number, or the
+# per-day vector from day_limits()). Returns list(windows, message)
+# with message NULL when added.
+add_window <- function(windows, day, from, to, limit = FALLBACK_MAX_BLOCKED_HOURS,
+                       days = FALLBACK_DAYS) {
+  s <- hhmm_to_min(from)
+  e <- hhmm_to_min(to)
+  if (is.na(s) || is.na(e) || !day %in% days) {
+    return(list(windows = windows, message = "Please choose a day and times."))
+  }
+  if (e == s) {
+    return(list(windows = windows, message = "'To' must differ from 'From'."))
+  }
+  if (e < s) e <- e + 1440L  # runs past midnight
+  all <- merge_windows(rbind(windows, data.frame(day = day, start = s, end = e,
+                                                 stringsAsFactors = FALSE)), days)
+  hours <- hours_per_day(all)[[day]]
+  lim <- limit_on(limit, day)
+  if (hours > lim) {
+    return(list(windows = windows, message = paste0(
+      "That window was not added: ", day, " would have ", round(hours, 1),
+      " h blocked; the limit is ", lim, " h ", limit_reason(limit, day), ".")))
+  }
+  list(windows = all, message = NULL)
 }
 
 # Sleep: one blocked window per chosen day (`days`) with the chosen times. `to`
@@ -424,12 +505,147 @@ test_sleep_windows <- function() {
   invisible(TRUE)
 }
 
+test_add_window <- function() {
+  days <- FALLBACK_DAYS
+  txt <- function(w) format_windows(w, days)
+  # two separate windows on the same day are both kept
+  r1 <- add_window(empty_windows(), "Mon", "09:00", "11:00")
+  r2 <- add_window(r1$windows, "Mon", "14:00", "16:30")
+  stopifnot(is.null(r1$message), is.null(r2$message), nrow(r2$windows) == 2,
+            txt(r2$windows) == "Mon 09:00-11:00;Mon 14:00-16:30")
+  # overlapping windows on the same day merge into one
+  r3 <- add_window(r2$windows, "Mon", "10:00", "15:00")
+  stopifnot(is.null(r3$message), nrow(r3$windows) == 1,
+            txt(r3$windows) == "Mon 09:00-16:30")
+  # adjacent (touching) windows merge too; another day is left alone
+  r4 <- add_window(r1$windows, "Mon", "11:00", "12:00")
+  r5 <- add_window(r4$windows, "Tue", "09:00", "10:00")
+  stopifnot(txt(r4$windows) == "Mon 09:00-12:00", nrow(r5$windows) == 2)
+  # a window overlapping sleep is merged with it, not dropped
+  sl <- add_sleep(empty_windows(), "23:00", "07:00", days)$windows
+  r6 <- add_window(sl, "Mon", "22:00", "23:30")
+  stopifnot(is.null(r6$message), nrow(r6$windows) == 7,
+            "Mon 22:00-07:00" %in% strsplit(txt(r6$windows), ";")[[1]])
+  # refused: over the daily limit (sleep 8 h + 3 h), From = To; windows unchanged
+  r7 <- add_window(sl, "Wed", "09:00", "12:00", limit = 10)
+  stopifnot(identical(r7$windows, sl), grepl("not added", r7$message),
+            grepl("Wed", r7$message), grepl("11 h", r7$message))
+  r8 <- add_window(sl, "Wed", "09:00", "10:00", limit = 10)   # 9 h: fine
+  stopifnot(is.null(r8$message))
+  r9 <- add_window(r1$windows, "Mon", "09:00", "09:00")
+  stopifnot(identical(r9$windows, r1$windows), grepl("must differ", r9$message))
+  # the saved row has overlapping windows merged
+  row <- build_response_row("R001", "K", "A", "quick", "DS",
+                            parse_windows("Mon 09:00-11:00;Mon 10:00-12:00"), "Sat")
+  stopifnot(row$blocked == "Mon 09:00-12:00")
+  # through the form
+  shiny::testServer(mod_questionnaire_server, args = list(con = NULL), {
+    session$setInputs(demo = TRUE, user = "R001", login = 1)
+    blocked(empty_windows())
+    session$setInputs(b_day = "Mon", b_start = "09:00", b_end = "11:00", b_add = 1)
+    session$setInputs(b_day = "Mon", b_start = "14:00", b_end = "16:30", b_add = 2)
+    stopifnot(nrow(blocked()) == 2, is.null(output$err_b_add$html))
+    session$setInputs(block = "A", course = "DS", program = "quick",
+                      pref_days = "Sat", terms = TRUE, save = 1)
+    stopifnot(identical(last_response()$blocked, "Mon 09:00-11:00;Mon 14:00-16:30"))
+    # overlapping: merged into one
+    session$setInputs(b_start = "10:00", b_end = "15:00", b_add = 3)
+    stopifnot(nrow(blocked()) == 1, txt(blocked()) == "Mon 09:00-16:30")
+    # refused: 7.5 h + 3 h is over 10 h; message under the row, nothing added
+    session$setInputs(b_start = "17:00", b_end = "20:00", b_add = 4)
+    stopifnot(nrow(blocked()) == 1, grepl("text-danger", output$err_b_add$html),
+              grepl("not added", output$err_b_add$html))
+    # a later valid window clears the message
+    session$setInputs(b_start = "17:00", b_end = "18:00", b_add = 5)
+    stopifnot(nrow(blocked()) == 2, is.null(output$err_b_add$html))
+  })
+  invisible(TRUE)
+}
+
+# Per-course daily limits: 10 h on a day with a class, 12 h on a day without.
+test_day_limits <- function() {
+  days <- FALLBACK_DAYS
+  tt <- tempfile(fileext = ".csv")
+  writeLines(c("course,day,start,end", "XA,Mon,09:00,10:30", "XA,Mon,14:00,15:00",
+               "XA,Wed,09:00,10:30"), tt)
+  # the real timetable's columns are what class_days() reads
+  stopifnot(all(c("course", "day", "start", "end") %in% names(read_csv_chr(PATH_TIMETABLE))))
+  stopifnot(setequal(class_days("XA", tt), c("Mon", "Wed")), is.null(class_days("ZZ", tt)),
+            is.null(class_days("XA", "no/such/file.csv")))
+  lim <- day_limits("XA", days, 10, 12, tt)
+  stopifnot(identical(names(lim), days), lim[["Mon"]] == 10, lim[["Wed"]] == 10,
+            lim[["Tue"]] == 12, lim[["Sun"]] == 12)
+  # unknown course (or none chosen yet): 10 h on every day
+  stopifnot(all(day_limits("ZZ", days, 10, 12, tt) == 10),
+            all(day_limits("", days, 10, 12, tt) == 10),
+            all(day_limits(NULL, days, 10, 12, tt) == 10))
+  # days_over_limit with a per-day limit; a plain number still means every day
+  w <- parse_windows("Mon 08:00-18:30;Tue 08:00-20:30;Thu 08:00-20:00")
+  stopifnot(identical(names(days_over_limit(w, lim)), c("Mon", "Tue")),   # 10.5, 12.5
+            identical(names(days_over_limit(w)), c("Mon", "Tue", "Thu")), # 10 h for all
+            length(days_over_limit(w, 13)) == 0)
+  # add_window: class day (Mon) allows 10 h but refuses 10.5 h
+  a1 <- add_window(empty_windows(), "Mon", "08:00", "18:00", lim, days)
+  a2 <- add_window(empty_windows(), "Mon", "08:00", "18:30", lim, days)
+  stopifnot(is.null(a1$message), !is.null(a2$message), nrow(a2$windows) == 0)
+  # no-class day (Tue) allows 12 h but refuses 12.5 h, naming day, hours and limit
+  b1 <- add_window(empty_windows(), "Tue", "08:00", "20:00", lim, days)
+  b2 <- add_window(empty_windows(), "Tue", "08:00", "20:30", lim, days)
+  stopifnot(is.null(b1$message), !is.null(b2$message),
+            identical(b2$message, paste0("That window was not added: Tue would have ",
+              "12.5 h blocked; the limit is 12 h on days without classes.")))
+  stopifnot(grepl("on days with classes", a2$message), grepl("Mon would have 10.5 h", a2$message))
+  # sleep (8 h) plus a 2 h window is fine on a class day, a 2.5 h window is refused
+  sl <- add_sleep(empty_windows(), "23:00", "07:00", days)$windows
+  stopifnot(is.null(add_window(sl, "Mon", "09:00", "11:00", lim, days)$message),
+            !is.null(add_window(sl, "Mon", "09:00", "11:30", lim, days)$message))
+  # the same 4 h window: refused on a class day (12 h), accepted on a free day
+  stopifnot(!is.null(add_window(sl, "Mon", "09:00", "13:00", lim, days)$message),
+            is.null(add_window(sl, "Tue", "09:00", "13:00", lim, days)$message))
+  # Save is blocked while a day is over its limit
+  ma <- function(blocked, limits) names(missing_answers(
+    "B", "B", "XA", "Sat", blocked, FALSE, TRUE, "B", c("XA"), days, limits))
+  stopifnot(length(ma(w, 13)) == 0, identical(ma(w, lim), "blocked"),
+            length(ma(parse_windows("Mon 08:00-18:00"), lim)) == 0)
+  # through the form (real timetable: DS has classes Mon-Fri, none on Sat/Sun;
+  # FE has classes on Tue, Thu, Fri and Sat)
+  shiny::testServer(mod_questionnaire_server, args = list(con = NULL), {
+    session$setInputs(demo = TRUE, user = "R001", login = 1)
+    blocked(empty_windows())
+    session$setInputs(course = "DS", b_day = "Sat", b_start = "08:00", b_end = "19:00",
+                      b_add = 1)                          # 11 h on a no-class day
+    stopifnot(nrow(blocked()) == 1, is.null(output$err_b_add$html))
+    session$setInputs(b_end = "20:30", b_add = 2)         # 12.5 h: refused
+    stopifnot(grepl("Sat would have 12.5 h blocked; the limit is 12 h on days without classes",
+                    output$err_b_add$html), nrow(blocked()) == 1)
+    session$setInputs(b_day = "Mon", b_start = "08:00", b_end = "18:30", b_add = 3)
+    stopifnot(grepl("Mon would have 10.5 h blocked; the limit is 10 h on days with classes",
+                    output$err_b_add$html))
+    # changing the course re-checks the windows: FE has a class on Sat, so 11 h is over
+    stopifnot(is.null(output$b_warning$html))
+    session$setInputs(course = "FE")
+    stopifnot(grepl("Sat \\(11 h, limit 10 h on days with classes\\)", output$b_warning$html))
+    session$setInputs(block = "A", program = "quick", pref_days = "Sat", terms = TRUE,
+                      save = 1)
+    stopifnot(is.null(last_response()), grepl("Too much blocked time", output$save_result$html))
+    # back to a course with no Saturday class: fine again, and it saves
+    session$setInputs(course = "DS")
+    stopifnot(is.null(output$b_warning$html))
+    session$setInputs(save = 2)
+    stopifnot(!is.null(last_response()), last_response()$blocked == "Sat 08:00-19:00")
+    # an unknown course uses 10 h on every day
+    session$setInputs(course = "ZZ")
+    stopifnot(grepl("Sat \\(11 h, limit 10 h per day\\)", output$b_warning$html))
+  })
+  invisible(TRUE)
+}
+
 # One-row survey-format data.frame built from form values.
 build_response_row <- function(resident_id, name, block, program, course,
                                blocked, pref_days, days = FALLBACK_DAYS) {
   data.frame(resident_id = resident_id, name = name, block = block,
              program = program, course = course,
-             blocked = format_windows(blocked, days),
+             blocked = format_windows(merge_windows(blocked, days), days),
              pref_days = paste(pref_days, collapse = ";"),
              pref_band = NO_BAND,
              stringsAsFactors = FALSE)[, SURVEY_COLUMNS]
@@ -525,14 +741,16 @@ time_choices <- function(from = "00:00", to = "24:00", step = 30) {
 
 # Every question is required. Returns a named list with one message per missing
 # answer (names: block, course, pref_days, blocked, terms); empty
-# when everything is complete. The block must be one of `blocks` and equal to
+# when everything is complete; no day may be over its blocked-hours limit
+# (`limits`, see day_limits()). The block must be one of `blocks` and equal to
 # the block in the signed-in resident's row (`resident_block`). Blocked times need at least one window or the
 # explicit "I have no blocked times" tick. Used for the red messages, for the
 # Save button and again on Save, so a skipped answer is never written.
 missing_answers <- function(block, resident_block, course, pref_days,
                             blocked, no_blocked, terms,
                             blocks = FALLBACK_BLOCKS, courses = q_courses(),
-                            days = FALLBACK_DAYS) {
+                            days = FALLBACK_DAYS,
+                            limits = FALLBACK_MAX_BLOCKED_HOURS) {
   one <- function(x) length(x) == 1 && !is.na(x)
   out <- list()
   if (!(one(block) && block %in% blocks)) {
@@ -550,6 +768,11 @@ missing_answers <- function(block, resident_block, course, pref_days,
   if (nrow(blocked) == 0 && !isTRUE(no_blocked)) {
     out$blocked <- paste("Add at least one blocked-time window, or tick",
                          "\"I have no blocked times\".")
+  }
+  over <- days_over_limit(blocked, limits)
+  if (length(over) > 0) {
+    out$blocked <- paste0("Too much blocked time, so this cannot be saved yet: ",
+                          over_text(over, limits), ". Shorten or remove windows.")
   }
   if (!isTRUE(terms)) {
     out$terms <- "You must agree to the Terms of Use and the data policy."
@@ -840,6 +1063,7 @@ mod_questionnaire_ui <- function(id) {
               selectInput(ns("b_end"), "To", choices = times[-1],
                           selected = "17:00", selectize = FALSE, width = "7rem"),
               actionButton(ns("b_add"), "Add window")),
+          uiOutput(ns("err_b_add")),
           div(class = "q-row",
               conditionalPanel(
                 "!input.sleep_same", ns = ns,
@@ -1003,10 +1227,13 @@ mod_questionnaire_server <- function(id, con = NULL) {
 
     # Every question is required: one red message under each missing answer,
     # and Save stays disabled until none is left. Save checks again on the server.
+    # Blocked hours allowed per day for the chosen course: 10 h on days with a
+    # class, 12 h on days without (class time itself is not counted).
+    limits <- reactive(day_limits(input$course, cfg$days, cfg$max_blocked_hours))
     unanswered <- reactive({
       missing_answers(input$block, resident()$block, input$course, input$pref_days,
                       blocked(), input$no_blocked, input$terms,
-                      blocks, q_courses(), cfg$days)
+                      blocks, q_courses(), cfg$days, limits())
     })
     field_error <- function(name) {
       renderUI({
@@ -1023,17 +1250,19 @@ mod_questionnaire_server <- function(id, con = NULL) {
       shiny::updateActionButton(session, "save", disabled = length(unanswered()) > 0)
     })
 
+    # Add window: several windows on one day are kept, overlapping or touching
+    # ones are merged, and a refused window says why under the row.
+    b_add_msg <- reactiveVal(NULL)
     observeEvent(input$b_add, {
-      s <- hhmm_to_min(input$b_start)
-      e <- hhmm_to_min(input$b_end)
-      if (e == s) {
-        showNotification("'To' must differ from 'From'.", type = "error")
-        return()
-      }
-      if (e < s) e <- e + 1440L  # runs past midnight
-      blocked(rbind(blocked(), data.frame(day = input$b_day, start = s, end = e,
-                                          stringsAsFactors = FALSE)))
+      r <- add_window(blocked(), input$b_day, input$b_start, input$b_end,
+                      limits(), cfg$days)
+      b_add_msg(r$message)
+      if (!is.null(r$message)) return()
+      blocked(r$windows)
       updateCheckboxInput(session, "no_blocked", value = FALSE)
+    })
+    output$err_b_add <- renderUI({
+      if (!is.null(b_add_msg())) div(class = "text-danger small", b_add_msg())
     })
 
     # Sleep day / from / to, like the blocked-time row. "Sleep cycle same for
@@ -1092,19 +1321,20 @@ mod_questionnaire_server <- function(id, con = NULL) {
       blocked(w[-drop, , drop = FALSE])
     })
     observeEvent(input$b_clear, {
+      b_add_msg(NULL)
       blocked(empty_windows())
       sleep_added(empty_windows())
     })
 
+    # Re-checked whenever the windows or the course change.
     output$b_warning <- renderUI({
-      limit <- cfg$max_blocked_hours
-      over <- days_over_limit(blocked(), limit)
+      over <- days_over_limit(blocked(), limits())
       if (length(over) == 0) return(NULL)
       div(class = "alert alert-warning mt-2",
           strong("Warning: "),
-          paste0(names(over), " (", round(over, 1), " h)", collapse = ", "),
-          paste0(" blocked for more than ", limit, " hours. You can still ",
-                 "save, but you will have little free time to wash."))
+          paste0("over the daily blocked-time limit on ", over_text(over, limits()),
+                 ". Shorten or remove those windows; the response cannot be ",
+                 "saved until every day is within its limit."))
     })
 
     observeEvent(input$save, {
@@ -1148,6 +1378,15 @@ mod_questionnaire_server <- function(id, con = NULL) {
       })
     })
     output$save_result <- renderUI(save_msg())
+
+    # Outputs that are empty are hidden by the CSS above (.q-form > :empty), and
+    # Shiny does not draw a hidden output, so it would never appear. Keep
+    # drawing them.
+    for (o in c("identity", "email_msg", "err_block", "err_course", "err_pref_days",
+                "err_blocked", "err_terms", "err_b_add", "b_list", "b_warning",
+                "save_result")) {
+      outputOptions(output, o, suspendWhenHidden = FALSE)
+    }
 
     last_response
   })
