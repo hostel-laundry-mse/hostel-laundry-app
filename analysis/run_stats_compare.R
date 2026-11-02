@@ -42,7 +42,7 @@ ba <- NULL; form <- NULL
 if (file.exists("data/feedback_form.csv")) {
   cat("\nSection 8: before vs after\n")
   form <- read_feedback_form("data/feedback_form.csv")
-  form <- form[!grepl("^S", form$q1_resident_id), ]        # real participants only
+  form <- form[is_real_resident(form$q1_resident_id), ]    # real participants only (R_C01-R_C20)
   cat("  feedback form:", nrow(form), "real participants\n")
   app <- NULL
   if (file.exists("data/laundry.sqlite")) {
