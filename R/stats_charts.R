@@ -8,11 +8,11 @@
 #   chart_utilisation()      Queue model: utilisation over 24 h vs at the peak
 #   chart_block_means(d)     Extra attempts by block (means, 95% CI)
 #   chart_abandon_gaps(d)    Abandonment gaps by group, with 95% CIs around 0
-#   chart_success_rule(n)    Why 16 of 21 is a fair bar (chance under 50/50)
+#   chart_success_rule(n)    Why 15 of 20 is a fair bar (chance under 50/50)
 # After (pre-pilot) charts, from compare_before_after():
 #   chart_before_after(ba)   Before vs after shares with 95% CIs
 #   chart_satisfaction(before_C, form)  1-5 ratings, before vs after
-#   chart_q12(form)          "Compared with now" answers and the 16-of-21 line
+#   chart_q12(form)          "Compared with now" answers and the 75% line
 
 # Validated categorical palette (dataviz reference): slot 1 blue, 2 orange,
 # 3 aqua; neutral inks for text; status colours are not used for series.
@@ -199,7 +199,7 @@ chart_abandon_gaps <- function(d) {
     ch_theme()
 }
 
-chart_success_rule <- function(n = 21, k_rule = 16) {
+chart_success_rule <- function(n = 20, k_rule = success_threshold(n)) {
   df <- data.frame(k = 0:n, p = stats::dbinom(0:n, n, 0.5))
   df$zone <- ifelse(df$k >= k_rule, "Rule met", "Rule not met")
   tail <- 1 - stats::pbinom(k_rule - 1, n, 0.5)
@@ -310,7 +310,7 @@ chart_q12 <- function(form, k_rule = NULL) {
     ggplot2::labs(title = sprintf("%d of %d rate the schedule better or much better: rule %s",
                                   k, n, if (k >= k_rule) "met" else "not met"),
                   subtitle = sprintf("Q12 'Compared with how you do laundry now, this schedule is...'. Success needs %d of %d%s",
-                                     k_rule, n, if (n == 21) " (fixed Nov 1)" else " (16 of 21 scaled)"),
+                                     k_rule, n, sprintf(" (%.0f%%, fixed before the pre-pilot)", 100 * SUCCESS_SHARE)),
                   x = NULL, y = "Participants",
                   caption = sprintf("One-sided exact binomial test vs 50%%: p = %.4f; exact 95%% CI %.0f%%-%.0f%%",
                                     stats::binom.test(k, n, 0.5, "greater")$p.value,

@@ -70,8 +70,13 @@ check("Block C baseline: n 20, pref time 6, pref day 8, give up 6, short 11",
       nrow(before_C) == 20 && sum(before_C$on_pref_time) == 6 && sum(before_C$on_pref_day) == 8 &&
         sum(before_C$abandoned) == 6 && sum(before_C$slot_gap > 0) == 11)
 set.seed(1)
-n <- 21
-fake <- data.frame(Timestamp = "x", id = sprintf("C%03d", 1:n),
+check("rule: 75% rounded up -> 15 of 20 (16 of 21, 18 of 24)",
+      success_threshold(20) == 15 && success_threshold(21) == 16 && success_threshold(24) == 18)
+check("real IDs: R_C01..R_C20 kept, SIM_C and others dropped",
+      identical(is_real_resident(c("R_C01", "R_C20", " r_c07 ", "SIM_C01", "S01", "C001")),
+                c(TRUE, TRUE, TRUE, FALSE, FALSE, FALSE)))
+n <- 23   # 20 real participants + 3 simulated rows that must be ignored
+fake <- data.frame(Timestamp = "x", id = c(sprintf("R_C%02d", 1:20), sprintf("SIM_C%02d", 1:3)),
   oct = sample(c("Yes", "No"), n, TRUE), clash = sample(c("Yes", "No"), n, TRUE, c(.1, .9)),
   day = sample(c("Yes", "No"), n, TRUE, c(.8, .2)), time = sample(c("Yes", "No"), n, TRUE, c(.8, .2)),
   long = "Yes", enough = sample(c("Yes", "No, I need 1 more", "No, I need 2 or more"), n, TRUE, c(.6, .3, .1)),
@@ -79,26 +84,29 @@ fake <- data.frame(Timestamp = "x", id = sprintf("C%03d", 1:n),
   trips = sample(c("0", "1", "2", "5 or more"), n, TRUE, c(.5, .3, .15, .05)),
   giveup = sample(c("Yes", "No", "Not sure"), n, TRUE, c(.1, .7, .2)),
   sat = sample(c("1 Very dissatisfied", "3", "4", "5 Very satisfied"), n, TRUE, c(.05, .15, .4, .4)),
-  cmp = c(rep("Better", 10), rep("Much better", 7), rep("About the same", 3), "Worse"),
+  cmp = c(rep("Better", 9), rep("Much better", 6), rep("About the same", 4), "Worse",
+          rep("Much better", 3)),
   free = "")
 tmp <- tempfile(fileext = ".csv"); write.csv(fake, tmp, row.names = FALSE)
 form <- read_feedback_form(tmp)
-check("form read: 21 rows, columns renamed in order",
-      nrow(form) == 21 && names(form)[12] == "q12_compared" && names(form)[13] == "extra_1")
+check("form read: 23 rows, columns renamed in order",
+      nrow(form) == 23 && names(form)[12] == "q12_compared" && names(form)[13] == "extra_1")
 app <- data.frame(resident_id = form$q1_resident_id, slots = 2, has_pref_day = TRUE, has_pref_band = TRUE,
-                  day_match = rep(c(TRUE, FALSE), c(17, 4)), time_match = rep(c(TRUE, FALSE), c(16, 5)))
+                  day_match = rep(c(TRUE, FALSE), c(17, 6)), time_match = rep(c(TRUE, FALSE), c(16, 7)))
 links <- data.frame(resp_id = before_C$resp_id[1:8], resident_id = form$q1_resident_id[1:8])
 ba <- compare_before_after(before_C, form, app, links)
 tt <- ba$tests
 check("section 8 rows: app + form outcomes, success rule, paired", nrow(tt) == 13)
 hl <- tt[tt$outcome == "Preferred time (headline)", ]
-check("headline: 16/21 vs 6/20 -> diff 0.46, z-test p computed",
-      r2(hl$estimate) == r2(16 / 21 - 6 / 20) && hl$p_value < 0.05)
+check("headline uses the 20 real only: 16/20 vs 6/20, z-test p computed",
+      r2(hl$estimate) == r2(16 / 20 - 6 / 20) && hl$p_value < 0.05 && grepl("16/20", hl$note))
 sr <- tt[tt$analysis == "Success rule", ]
-check("success rule: 17 of 21 better -> rule met, one-sided p = P(X>=17 | 0.5)",
-      sr$statistic == 17 && grepl("MET", sr$note) &&
-        abs(sr$p_value - (1 - pbinom(16, 21, 0.5))) < 1e-12)
-check("16 of 21 by chance under 50/50 is 1.3% (plan doc)", round(1 - pbinom(15, 21, 0.5), 3) == 0.013)
+check("success rule: 15 of 20 real better (SIM ignored) -> MET, p = P(X>=15 | 0.5)",
+      sr$statistic == 15 && grepl("15 of 20; rule MET", sr$note) &&
+        abs(sr$p_value - (1 - pbinom(14, 20, 0.5))) < 1e-12)
+check("15 of 20 by chance under 50/50 is 2.1% (plan doc)", round(1 - pbinom(14, 20, 0.5), 3) == 0.021)
+check("power of 15-of-20 rule: 0.62 / 0.80 / 0.93 at 75 / 80 / 85% (plan doc)",
+      identical(round(1 - pbinom(14, 20, c(.75, .8, .85)), 2), c(0.62, 0.80, 0.93)))
 sat <- tt[tt$outcome == "Satisfaction (1-5)" & tt$analysis == "Before vs after", ]
 check("satisfaction: Mann-Whitney with rank-biserial r in [-1, 1]",
       grepl("Mann-Whitney", sat$test) && abs(sat$effect) <= 1)

@@ -225,9 +225,16 @@ read_feedback_form <- function(path, has_timestamp = TRUE) {
   f
 }
 
-# Success bar: 16 of 21 (fixed Nov 1). If a different number fill the form,
-# the same share (16/21 = 76%) is kept, rounded up.
-success_threshold <- function(n) if (n == 21) 16 else ceiling(16 / 21 * n)
+# Success rule (agreed by the team): at least 75% of the real participants
+# rate the schedule better or much better, rounded up. With 20 participants
+# that is 15 of 20; it gives 16 of 21 if 21 take part.
+SUCCESS_SHARE <- 0.75
+success_threshold <- function(n) ceiling(SUCCESS_SHARE * n - 1e-9)
+
+# Real pre-pilot participants have IDs R_C01 ... R_C20; simulated residents
+# (SIM_C...) are never counted in the before-vs-after comparison.
+REAL_ID_PATTERN <- "^R_C[0-9]+$"
+is_real_resident <- function(id) grepl(REAL_ID_PATTERN, toupper(trimws(id)))
 
 # Answers -> numbers / TRUE-FALSE, tolerant of capitalisation and wording.
 st_yes <- function(x) tolower(trimws(x)) %in% c("yes", "y", "true", "1")
@@ -236,13 +243,13 @@ st_first_number <- function(x) {
 }
 st_better <- function(x) tolower(trimws(x)) %in% c("better", "much better")
 
-# App-computed outcomes for real participants (IDs not starting with "S").
+# App-computed outcomes for real participants only (IDs R_C01 ... R_C20).
 #   bookings  - read_bookings(con): the published optimiser bookings
 #   responses - read_responses(con): pref_days ("Sat;Sun"), pref_band ("evening")
 #   config    - load_config(): bands (band, from, to)
 # A slot is "at the preferred time" if it starts inside the person's band.
 app_outcomes <- function(bookings, responses, config) {
-  real <- responses[!grepl("^S", responses$resident_id), ]
+  real <- responses[is_real_resident(responses$resident_id), ]
   b <- bookings[bookings$source == "optimiser" & bookings$person %in% real$resident_id, ]
   wd <- c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
   b$weekday <- wd[as.POSIXlt(as.Date(b$date))$wday + 1]
@@ -267,6 +274,9 @@ app_outcomes <- function(bookings, responses, config) {
 # app outcomes if given). links (optional, private) = data.frame(resp_id,
 # resident_id) for people in both, enabling paired tests.
 compare_before_after <- function(before_C, form, app = NULL, links = NULL) {
+  # Only real participants (R_C01 ... R_C20) count; SIM_C rows are dropped.
+  form <- form[is_real_resident(form$q1_resident_id), ]
+  if (!is.null(app)) app <- app[is_real_resident(app$resident_id), ]
   rows <- list()
   add <- function(r) rows[[length(rows) + 1]] <<- r
   nb <- nrow(before_C)
@@ -344,8 +354,7 @@ compare_before_after <- function(before_C, form, app = NULL, links = NULL) {
              statistic = k, p_value = bt$p.value, effect_name = "share", effect = k / n,
              n = n, note = paste0(sprintf("%d of %d; rule %s", k, n,
                                           if (k >= kr) "MET" else "NOT met"),
-                                  if (n != 21) sprintf(" (bar scaled from 16 of 21 to %d of %d)", kr, n)
-                                  else "")))
+                                  sprintf(" (rule: at least %.0f%%)", 100 * SUCCESS_SHARE))))
 
   # Paired tests for people in both surveys
   paired <- NULL
