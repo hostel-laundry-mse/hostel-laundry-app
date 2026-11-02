@@ -4,22 +4,22 @@ Shiny app for a hostel. Residents fill in a questionnaire (their course,
 times they can't wash, wash program). The app works out when each person is
 free from public course timetables, and an optimiser books every resident
 into a washing machine in their own block for each 10-day cycle. Residents
-see their slots, check in when they start, can change or release a slot, and
-can join a queue for extra slots that others release.
+see their slots, check in when they start, and can cancel a slot, which makes
+it a free slot anyone can claim.
 
 ## Stack
 
 - **shiny** + **bslib**: UI, `page_navbar` with pages Questionnaire, My slots, Schedule, Admin
 - **ompr** + **ompr.roi** + **ROI.plugin.glpk**: the scheduling model, solved with GLPK.
   Solver choice is under review for speed (HiGHS is the alternative); do not change it without the lead.
-- **DBI** + **RSQLite**: storing responses, bookings, changes, check-ins and the queue (`*.sqlite`, git-ignored)
+- **DBI** + **RSQLite**: storing responses, bookings, cancellations and check-ins (`*.sqlite`, git-ignored)
 - **DT**, **ggplot2**: schedule tables and charts
 - **readr**, **dplyr**: reading CSVs and data wrangling
 - **renv**: package versions locked in `renv.lock`. After clone, run `renv::restore()`.
 
 Run with `shiny::runApp()`. Files in `R/` are sourced automatically.
 The app assumes the laptops it runs on are set to India time (IST): slot
-times, check-in and the change cutoff all use the computer's clock.
+times, check-in and the cancellation cutoff all use the computer's clock.
 The laundry machines run 24 hours (00:00-24:00); residents' sleep is handled by their own blocked times; the last normal wash starts 22:30 and the last quick wash 23:00 so the buffer ends by midnight.
 
 ## File ownership
@@ -43,13 +43,13 @@ What each file does:
 | File | Contents |
 |---|---|
 | `app.R` | Joins modules into the navbar app; shared library calls |
-| `R/data_load.R` | `load_survey()`, `load_config()`, `load_timetable()`, `build_free_windows()` (free time per person per date), `db_connect()` and database read/write helpers for the tables below |
-| `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `optimise_schedule()`: wrapper returning only the schedule; `find_alternative_slots()`: options when someone changes a slot; `pick_from_queue()`: who gets a released slot |
+| `R/data_load.R` | `load_survey()`, `load_config()`, `load_timetable()`, `build_free_windows()` (free time per person per date), `db_connect()` and database read/write helpers for the tables below; `slot_penalties()`: who loses slots for going over the cancellation or no-show limit |
+| `R/optimiser.R` | `run_optimiser()`: free windows + survey + config + each person's last booking date from the previous cycle to list(schedule, underserved, status, diagnostics); `run_optimiser()` also takes the slots each person lost to penalties; `optimise_schedule()`: wrapper returning only the schedule |
 | `R/checker.R` | `check_schedule()`: validates a schedule against every rule below, returns problems |
 | `R/simulate_blockC.R` | `simulate_blockC()`: simulated block C residents (survey format) for the pre-pilot; defines functions only, nothing runs on app start |
 | `R/mod_questionnaire.R` | Questionnaire page: block, program, course, blocked times (with the 10-hour check), preferences |
-| `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; view queue, changes and no-shows. `mod_admin_server()` returns only the published schedule (NULL until Publish), since the resident pages save whatever it returns as real bookings |
-| `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" flow, changes left, join the extra-slot queue. Schedule page: all machines by date, "Free now" list |
+| `R/mod_admin.R` | Admin page: pick cycle start date, run optimiser and checker, publish; see who lost slots; view cancellations and no-shows. `mod_admin_server()` returns only the published schedule (NULL until Publish), since the resident pages save whatever it returns as real bookings |
+| `R/mod_results.R` | My slots page: own bookings, check-in button, "can't make it" cancels a slot, cancellations and no-shows against their limits. Schedule page: all machines by date, "Free now" list |
 | `data/config.csv` | Machines, programs, opening hours, rules |
 | `data/timetable.csv` | Weekly lecture timetable per course (public data): the real one, used for the pre-pilot |
 | `data/fake_timetable.csv` | Small made-up timetable, for tests |
@@ -69,7 +69,8 @@ What each file does:
 ## Scheduling rules
 
 **Cycle.** Schedules cover 10 days from a cycle start date the admin picks.
-Everyone gets 2 bookings per cycle. Extra washes come only from the queue.
+Everyone gets 2 bookings per cycle, less any slots lost to penalties. Extra
+washes come only from free slots.
 
 **Gap between washes.** A person's consecutive bookings are 4 or 5 days
 apart (by date). This also applies across cycles: the first booking of a
@@ -77,8 +78,10 @@ cycle is 4-5 days after the person's last booking of the previous cycle.
 To keep the next cycle possible, the second booking falls on day 6 or later
 of the cycle. A person with no booking in the previous cycle has no
 constraint on their first booking. The gap is measured from the dates the
-optimiser planned, even if the person changed the slot or did not show up;
-extra slots from the queue do not count.
+optimiser planned, even if the person cancelled the slot or did not show up;
+free slots they claimed do not count. If the 4-5 day window has already passed
+when a cycle starts, as it can after a penalty, the upper limit is dropped for
+that person's first booking.
 
 **Time blocks.** Each day is cut into 30-minute blocks from opening time. A
 booking starts on a block and holds the machine for
@@ -100,31 +103,32 @@ starts (e.g. `Mon 23:30-07:30` runs into Tuesday) and counts towards that day.
 - A machine runs at most one booking at a time, buffer included.
 - Emergency reserve: on each date, each block keeps at least `reserve_share` of its machine time unbooked.
 - Busy hours above `peak_target` are avoided where possible.
-- Preferred days and time bands are honoured where possible; getting everyone a booking always comes first.
+- Preferred days are honoured where possible; getting everyone a booking always comes first. There is no time-of-day preference: `pref_band` is ignored.
 - If someone's free time leaves no valid booking, they are listed as underserved with the reason.
 
-## Changes, check-in and the queue
+## Cancellations, no-shows and free slots
 
-**Changing a slot.**
-- Allowed up to 6 hours before the slot starts.
-- At most 3 changes per person in any 30 days. A change applies to that one booking only.
-- A changed slot does not have to keep the 4-5 day gap, but it must still be on a different date from the person's other bookings and obey every other rule. The next cycle's gap is measured from the date the optimiser originally planned, so a change never makes the next cycle impossible.
-- Flow: the person taps "Can't make it", the app shows alternative slots that obey every rule above without moving anyone else, and the person picks one or releases the slot.
-- Less than 6 hours before: no change, but the person can still release the slot (counts as one of the 3).
+**Cancelling.** The person taps "Can't make it" up to 6 hours before the slot
+starts. Slots cannot be moved to another time. Less than 6 hours before, the
+slot cannot be cancelled: not checking in makes it a no-show.
 
 **Check-in.** The person taps "Started" between the slot start and 15
 minutes after. No check-in by then: the booking is marked a no-show and the
-slot is released.
+slot goes to waste. Nobody else can take it.
 
-**Released slots and the queue.** People can join a queue asking for an extra
-slot. When a slot is released it goes to the first eligible person in the
-queue. Eligible means: same block, their program fits in the released machine
-time, it is inside their free time, and they have no other booking that day.
-Order: people with fewer than 2 bookings this cycle first, then earliest
-request. There are no notifications: the new booking appears in the person's
-My slots. If the slot starts too soon for that (under 1 hour away) or nobody
-in the queue fits, it goes on the Schedule page's "Free now" list, where any
-eligible resident can claim it, first come first served.
+**Free slots.** A cancelled slot goes on the Schedule page's "Free now" list,
+where anyone eligible can claim it, first come first served. Eligible means:
+same block, their program fits in the machine time, it is inside their free
+time, and they have no other booking that day. There is no queue and no
+priority order, and someone can claim a slot whatever their count this cycle.
+
+**Penalties.** In the 30 days before a cycle starts, a person may have 3
+cancellations and 2 no-shows. Going over the cancellation limit loses 1 slot
+in that cycle, and going over the no-show limit loses 1 slot, so going over
+both loses both slots. `slot_penalties()` works this out when the admin
+generates a schedule, and the admin must pass it to `run_optimiser()` and
+`check_schedule()`. A person with one slot still keeps the 4-5 day gap from
+their last planned booking.
 
 ## Survey data format
 
@@ -184,10 +188,10 @@ optimiser takes, one row per free stretch of time:
 - `rules,gap_min_days,<days>` and `rules,gap_max_days,<days>`: days between a person's consecutive bookings (default 4 and 5)
 - `rules,lecture_margin_min,<minutes>`: unavailable time before and after each lecture (default 30)
 - `rules,max_blocked_hours,<hours>`: personal blocked time allowed per day, sleep included (default 10)
-- `rules,change_cutoff_hours,<hours>`: latest a slot can be changed before it starts (default 6)
-- `rules,max_changes,<n>` and `rules,changes_window_days,<days>`: change limit (default 3 per 30)
+- `rules,cancel_cutoff_hours,<hours>`: latest a slot can be cancelled before it starts (default 6)
+- `rules,max_cancellations,<n>` and `rules,max_no_shows,<n>`: how many are allowed before a slot is lost (default 3 and 2)
+- `rules,penalty_window_days,<days>`: how far back they are counted from the cycle start (default 30)
 - `rules,checkin_grace_min,<minutes>`: time after slot start to check in (default 15)
-- `rules,queue_min_lead_min,<minutes>`: released slots starting sooner than this go to "Free now" instead of the queue (default 60)
 - `rules,reserve_share,<0-1>`: share of machine time per block per date kept free as emergency reserve (default 0)
 - `rules,peak_target,<minutes>`: booked machine-minutes per block per clock hour above which the optimiser applies a penalty (default: no penalty)
 - `out_of_order,<machine id>,1`: machine that must not be used, e.g. `out_of_order,C-2,1` (default: none)
@@ -217,12 +221,12 @@ SQLite, created and accessed through helpers in `R/data_load.R`:
   empty until set. `status` is `booked`, `checked_in`, `released`,
   `no_show`, `moved` or `finished`. Use `check_in()` and `check_out()` to set
   them; `set_booking_status()` refuses `finished`.
-  `source` is `optimiser`, `change`, `queue` or `free_now`.
-  A change marks the old row `moved` and adds a new row, so rows with
-  `source = optimiser` (any status) always hold the planned dates used for
-  the next cycle's gap.
-- `changes`: `person, booking_id, at, kind` (`change` or `release`), used for the 3-per-30-days limit.
-- `queue`: `person, requested_at, status` (`waiting`, `served`, `withdrawn`).
+  `source` is `optimiser` or `free_now`. Rows with `source = optimiser` (any
+  status) always hold the planned dates used for the next cycle's gap. The
+  `moved` status and the `change` and `queue` sources only appear in old data.
+- `changes`: `person, booking_id, at, kind`. `kind` is `release` for a
+  cancellation, counted for the limit (`change` only in old data).
+- `queue`: old data only, no longer written. Remove it with the Admin page's Queue tab.
 - `residents`: `resident_id, name, email, block`. The people allowed to log
   in, loaded from `data/participants.csv` (git-ignored, emails must end in
   `@mse.ac.in`). `write_residents()` replaces the whole list; someone removed

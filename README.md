@@ -2,8 +2,8 @@
 
 A Shiny app that books every hostel resident into a washing machine twice
 per 10-day cycle, 4-5 days apart, around their lectures and blocked times,
-using an integer program (ompr + GLPK). Residents can check in, change or
-release a slot, and queue for slots others release.
+using an integer program (ompr + GLPK). Residents can check in, cancel a slot,
+and claim free slots others cancel.
 
 ## Requirements
 
@@ -36,9 +36,9 @@ Rscript -e "shiny::runApp(launch.browser = TRUE)"
 ## Pages
 
 - **Questionnaire**: residents enter block, program, course, blocked times and preferences.
-- **My slots**: a resident's slots, check-in, "can't make it" (change or release), extra-slot queue.
+- **My slots**: a resident's slots, check-in, "can't make it" (cancel), cancellations and no-shows so far.
 - **Schedule**: the full schedule for every machine by date, and the "Free now" list.
-- **Admin**: pick the cycle start, run the optimiser and checker, publish; see queue, changes and no-shows.
+- **Admin**: pick the cycle start, run the optimiser and checker, publish; see who lost slots, cancellations and no-shows.
 
 ## Data
 

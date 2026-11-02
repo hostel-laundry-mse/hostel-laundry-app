@@ -23,8 +23,6 @@ bid <- function(con, p, d) {
   b <- read_bookings(con, p); b$booking_id[b$date == d & b$status %in% RES_ACTIVE][1]
 }
 status_of <- function(con, id) { b <- read_bookings(con); b$status[b$booking_id == id] }
-using_p1 <- exists("pick_from_queue", mode = "function")
-cat("Person 1's helpers loaded:", using_p1, "\n\n")
 
 # ---- 0. empty database (before anything is published) --------------------------
 con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
@@ -93,140 +91,96 @@ check("not a no-show at start+15", status_of(con, id2) == "booked")
 x <- ctx_at(con, "2026-11-03", "11:16")
 check("no-show at start+16", status_of(con, id2) == "no_show")
 check("checked-in (or finished) slot is not a no-show", status_of(con, id) %in% c("checked_in", "finished"))
-check("no-show counted", res_no_shows(x$bookings, "R002") == 1)
+check("no-show counted", res_no_shows(x$bookings, "R002", x$now, x$s) == 1)
+check("a no-show is wasted: not on Free now", !id2 %in% res_free_now(x, "R001")$booking_id)
 dbDisconnect(con)
 
-# ---- 4. change / release windows ----------------------------------------------
+# ---- 4. cancelling ----------------------------------------------------------------
 con <- fresh()
 id <- bid(con, "R003", "2026-11-10")            # 15:00-16:00, A-2
 x <- ctx_at(con, "2026-11-10", "09:00")
-check("6 h before: can move or release", res_change_status(bk(x, id), x$now, x$s, 3)$mode == "change")
+check("6 h before: can cancel", res_cancel_status(bk(x, id), x$now, x$s)$ok)
 x <- ctx_at(con, "2026-11-10", "09:01")
-check("5 h 59 min before: release only", res_change_status(bk(x, id), x$now, x$s, 3)$mode == "release")
-x <- ctx_at(con, "2026-11-10", "15:00")
-check("after it starts: nothing", !res_change_status(bk(x, id), x$now, x$s, 3)$ok)
-x <- ctx_at(con, "2026-11-04", "08:00")
-check("no changes left: nothing", !res_change_status(bk(x, id), x$now, x$s, 0)$ok)
-x <- ctx_at(con, "2026-11-10", "10:00")
-check("moving under 6 h refused",
-      !res_move(x, id, "R003", data.frame(person = "R003", machine = "A-2",
-                date = "2026-11-10", start = "19:00", end = "20:00"))$ok)
-
-# ---- 5. alternatives obey every rule -------------------------------------------
-dbDisconnect(con); con <- fresh()     # fresh: section 4 moved the clock forward
-id <- bid(con, "R003", "2026-11-10")
-x <- ctx_at(con, "2026-11-04", "08:00")
-alts <- res_alternatives(x, bk(x, id), n = 50)
-check("alternatives found", nrow(alts) > 0)
-others <- x$active[x$active$booking_id != id, ]
-ok_rule <- vapply(seq_len(nrow(alts)), function(i)
-  res_why_not("R003", alts$machine[i], alts$date[i], alts$start[i], others, x$survey, x$fw, x$s) == "",
-  logical(1))
-check("every alternative passes block, free time, machine+buffer, reserve, own-date rules", all(ok_rule))
-check("no alternative on R003's other wash date (Nov 5)", !any(alts$date == "2026-11-05"))
-check("no alternative overlapping the original time (Nov 10, 15:00-16:00), on any machine",
-      !any(alts$date == "2026-11-10" & res_min(alts$start) < 960 & res_min(alts$end) > 900))
-check("all alternatives on A machines, in the future, inside the cycle",
-      all(grepl("^A-", alts$machine)) && all(res_dt(alts$date, alts$start) > x$now) &&
-      all(res_in_cycle(alts$date, x$cycle_start, x$s)))
-check("all on the 30-min grid from 07:00 and length = program (60)",
-      all((res_min(alts$start) - 420) %% 30 == 0) && all(res_min(alts$end) - res_min(alts$start) == 60))
-fb <- res_find_alternatives(bk(x, id), x$active, x$survey, x$fw, x$s, x$cycle_start, x$now, 50)
-check("stand-in finder also obeys the rules", all(vapply(seq_len(nrow(fb)), function(i)
-  res_why_not("R003", fb$machine[i], fb$date[i], fb$start[i], others, x$survey, x$fw, x$s) == "",
-  logical(1))))
-
-# ---- 6. moving --------------------------------------------------------------------
-r <- res_move(x, id, "R003", alts[1, ])
-check("move succeeds", r$ok)
-b <- read_bookings(con, "R003")
-check("old row marked moved, new row source = change",
-      status_of(con, id) == "moved" && sum(b$source == "change" & b$status == "booked") == 1)
-check("move counted as a change (kind = change)",
-      nrow(read_changes(con, "R003")) == 1 && read_changes(con, "R003")$kind == "change")
-check("optimiser row keeps its planned date (gap rule for next cycle)",
-      any(b$source == "optimiser" & b$date == "2026-11-10"))
-taken <- data.frame(person = "R003", machine = "A-1", date = "2026-11-03", start = "11:00", end = "12:00")
-newid <- max(b$booking_id)
-x <- ctx_at(con, "2026-11-04", "08:00")
-check("moving onto someone's slot refused", !res_move(x, newid, "R003", taken)$ok)
-check("refused move uses no change", res_changes_used(con, "R003", x$now, x$s) == 1)
-
-# 3 changes max, release counts, resets after 30 days
-for (k in 1:2) {
-  x <- ctx_at(con, "2026-11-04", "08:00")
-  cur <- read_bookings(con, "R003"); cur <- cur[cur$status == "booked" & cur$date != "2026-11-05", ]
-  if (k == 1) { a <- res_alternatives(x, cur[1, ]); check("second move", res_move(x, cur$booking_id[1], "R003", a[1, ])$ok) }
-  else check("release counts too", res_release(x, cur$booking_id[1], "R003")$ok)
-}
-x <- ctx_at(con, "2026-11-04", "08:00")
-check("3 changes used", res_changes_used(con, "R003", x$now, x$s) == 3)
-cur <- read_bookings(con, "R003"); cur <- cur[cur$status == "booked", ]
-check("4th change refused", !res_release(x, cur$booking_id[1], "R003")$ok)
-check("changes come back after 30 days",
-      res_changes_left(con, "R003", at("2026-12-04", "08:01"), x$s) == 3)
+check("5 h 59 min before: can't cancel", !res_cancel_status(bk(x, id), x$now, x$s)$ok)
+check("cancelling under 6 h refused, slot stays booked",
+      !res_release(x, id, "R003")$ok && status_of(con, id) == "booked")
+check("...and refused cancel isn't counted", res_cancellations(con, "R003", x$now, x$s) == 0)
+x <- ctx_at(con, "2026-11-10", "15:16")
+check("...so missing it becomes a no-show", status_of(con, id) == "no_show")
+check("someone else can't cancel R002's slot",
+      !res_release(ctx_at(con, "2026-11-03", "01:00"), bid(con, "R002", "2026-11-08"), "R001")$ok)
 dbDisconnect(con)
 
-# ---- 7. queue ---------------------------------------------------------------------
 con <- fresh()
-x <- ctx_at(con, "2026-11-02", "08:00")
-check("R008 holding 2 unused slots can't join yet", res_queue_status(x, "R008")$state == "not_yet")
-check("joining refused", !res_join_queue(x, "R008")$ok)
-for (d in c("2026-11-04", "2026-11-09")) set_booking_status(con, bid(con, "R008", d), "checked_in")
-if (res_can_check_out()) check_out(con, bid(con, "R008", "2026-11-09"), at = at("2026-11-09", "13:40"))
-x <- ctx_at(con, "2026-11-02", "08:00")
-check("R008 after using both can join", res_join_queue(x, "R008")$ok)
-check("R008 waiting, number 1", res_queue_status(ctx_at(con, "2026-11-02", "08:01"), "R008")$position == 1)
+ids <- read_bookings(con, "R005")$booking_id    # two washes, both days away
+x <- ctx_at(con, "2026-11-02", "00:30")
+check("cancel works", res_release(x, ids[1], "R005")$ok)
+check("cancelled slot is 'released', recorded as kind = release",
+      status_of(con, ids[1]) == "released" && read_changes(con, "R005")$kind == "release")
+check("cancellation counted", res_cancellations(con, "R005", x$now, x$s) == 1)
+for (extra in 1:3) add_change(con, "R005", ids[1], "release", at = x$now)
+check("4 cancellations so far...", res_cancellations(con, "R005", x$now, x$s) == 4)
+check("...and going over the limit does not block another cancel",
+      res_release(x, ids[2], "R005")$ok)
+check("cancellations drop out after 30 days",
+      res_cancellations(con, "R005", x$now + 31 * 86400, x$s) == 0)
+dbDisconnect(con)
 
-# R009 (C, normal) releases Sat 08 Nov 15:00 days ahead -> R008 (C, quick) gets it
-id9 <- bid(con, "R009", "2026-11-08")
-x <- ctx_at(con, "2026-11-02", "09:00")
-r <- res_release(x, id9, "R009")
-b <- read_bookings(con)
-got <- b[b$source == "queue", ]
-check("released slot went straight to R008 in the queue", r$ok && nrow(got) == 1 && got$person == "R008" &&
-      got$machine == "C-1" && got$date == "2026-11-08" && got$start == "15:00")
-check("R008 gets their own program length (quick = 30 min)", got$end == "15:30")
-check("R008's queue request is served", read_queue(con)$status[read_queue(con)$person == "R008"] == "served")
-check("released row stays 'released' (history kept)", status_of(con, id9) == "released")
-
-# queue order: fewer than 2 first
-x <- ctx_at(con, "2026-11-02", "10:00")
-check("R009 (now holds 1) can join", res_join_queue(x, "R009")$ok)
-add_to_queue(con, "R007", requested_at = at("2026-11-02", "09:30"))   # earlier, holds 2
-x <- ctx_at(con, "2026-11-02", "10:01")
-check("queue order: R009 (holds 1) ahead of R007 (holds 2, asked earlier)",
-      res_queue_status(x, "R009")$position == 1 && res_queue_status(x, "R007")$position == 2)
-q <- read_queue(con, "waiting")
-# a C-1 slot both R009 and R007 can take (found from their real free time)
-both <- NULL
-for (d in format(as.Date("2026-11-03") + 0:7)) for (m in seq(x$s$open, x$s$close - 90, 30)) {
-  st <- res_hhmm(m)
-  if (res_why_not("R009", "C-1", d, st, x$active, x$survey, x$fw, x$s) == "" &&
-      res_why_not("R007", "C-1", d, st, x$active, x$survey, x$fw, x$s) == "") {
-    both <- data.frame(machine = "C-1", date = d, start = st); break
-  }
-  if (!is.null(both)) break
+# ---- 5. penalties ------------------------------------------------------------------
+# Cycle starts 1 Dec, so the 30-day window is 1 Nov to 30 Nov.
+pen_setup <- function(cancels = 0, no_shows = 0, person = "R001") {
+  con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
+  n <- max(cancels + no_shows, 1)
+  slots <- data.frame(person = person, machine = "A-1", date = format(as.Date("2026-11-10") + seq_len(n)),
+                      start = "10:00", end = "10:30")
+  ids <- add_bookings(con, slots, status = "checked_in")
+  for (i in seq_len(cancels)) add_change(con, person, ids[i], "release", at = "2026-11-15 09:00:00")
+  for (i in seq_len(no_shows)) set_booking_status(con, ids[cancels + i], "no_show")
+  con
 }
-check("found a slot both R009 and R007 are free for", !is.null(both))
-pk <- res_pick_from_queue(both, q, x$active, x$survey, x$fw, x$s, x$cycle_start, x$now)
-check("stand-in picker chooses R009 first", identical(pk$person, "R009"))
-check("blocked time respected: R009 not eligible Fri 06 Nov 09:00 (blocked Fri 07-12)",
-      res_why_not("R009", "C-1", "2026-11-06", "09:00", x$active, x$survey, x$fw, x$s) == "Not in your free time")
-check("D resident never gets a C slot",
-      res_why_not("R010", "C-1", "2026-11-06", "09:00", x$active, x$survey, x$fw, x$s) == "Other block")
-check("leaving the queue works", res_leave_queue(x, "R007")$ok &&
-      !"R007" %in% read_queue(con, "waiting")$person)
+lost_for <- function(cancels, no_shows) {
+  con <- pen_setup(cancels, no_shows); on.exit(dbDisconnect(con))
+  p <- slot_penalties(con, "2026-12-01", config, now = at("2026-12-01", "00:00"))
+  sum(p$slots_lost[p$resident_id == "R001"])
+}
+check("3 cancellations are allowed: no slot lost", lost_for(3, 0) == 0)
+check("4th cancellation loses 1 slot", lost_for(4, 0) == 1)
+check("2 no-shows are allowed: no slot lost", lost_for(0, 2) == 0)
+check("3rd no-show loses 1 slot", lost_for(0, 3) == 1)
+check("over both limits loses both slots", lost_for(4, 3) == 2)
+check("many over one limit still loses only 1", lost_for(9, 0) == 1)
+
+con <- pen_setup(4, 3)
+p <- slot_penalties(con, "2027-01-15", config, now = at("2027-01-15", "00:00"))
+check("events older than 30 days don't count", nrow(p) == 0)
+p <- slot_penalties(con, "2026-11-01", config, now = at("2026-11-01", "00:00"))
+check("events after the cycle starts don't count", nrow(p) == 0)
+dbDisconnect(con)
+
+con <- dbConnect(RSQLite::SQLite(), ":memory:"); db_init(con)
+ids <- add_bookings(con, data.frame(person = "R001", machine = "A-1",
+                                    date = c("2026-11-10", "2026-11-14", "2026-11-18"),
+                                    start = "10:00", end = "10:30"))
+p <- slot_penalties(con, "2026-12-01", config, now = at("2026-12-01", "00:00"))
+check("a missed slot nobody opened the app for still counts as a no-show",
+      p$no_shows == 3 && p$slots_lost == 1)
+add_change(con, "R001", ids[1], "change", at = "2026-11-15 09:00:00")
+p <- slot_penalties(con, "2026-12-01", config, now = at("2026-12-01", "00:00"))
+check("an old 'change' row isn't a cancellation", p$cancellations == 0)
+check("no events: empty result, right columns",
+      identical(names(slot_penalties(con, "2026-01-01", config)),
+                c("resident_id", "cancellations", "no_shows", "slots_lost")) &&
+        nrow(slot_penalties(con, "2026-01-01", config)) == 0)
 dbDisconnect(con)
 
 # ---- 8. Free now and claiming -------------------------------------------------------
 con <- fresh()
 id7 <- bid(con, "R007", "2026-11-07")           # Sat 14:00-15:00 C-1
-x <- ctx_at(con, "2026-11-07", "13:30")
-check("release 30 min before (allowed: release only)", res_release(x, id7, "R007")$ok)
+x <- ctx_at(con, "2026-11-07", "08:00")
+check("cancel exactly 6 h before", res_release(x, id7, "R007")$ok)
 x <- ctx_at(con, "2026-11-07", "13:31")
 f <- res_free_now(x, "R008")
-check("it's on Free now, marked starting soon", nrow(f) == 1 && f$booking_id == id7 && f$soon)
+check("it's on Free now", nrow(f) == 1 && f$booking_id == id7)
 f10 <- res_free_now(x, "R010")
 check("D-block resident sees 'Other block'", f10$why_not == "Other block")
 check("D-block resident can't claim", !res_claim(x, id7, "R010")$ok)
@@ -263,7 +217,9 @@ testServer(mod_results_server, args = list(schedule = sch, view = "mine", con = 
         grepl("Signed in as", output$user_box$html))
   check("R001 sees both slots", grepl("Tue 03 Nov, 10:00-10:30", output$cards$html) &&
         grepl("Sat 07 Nov, 09:00-09:30", output$cards$html))
-  check("summary shows 3 changes left", grepl("Changes left: 3 of 3", output$summary$html))
+  check("summary shows cancellations and no-shows against their limits",
+        grepl("Cancellations in the last 30 days: 0 \\(3 allowed\\)", output$summary$html) &&
+          grepl("No-shows in the last 30 days: 0 \\(2 allowed\\)", output$summary$html))
   i1 <- bid(con, "R001", "2026-11-03")
   session$setInputs(action = list(type = "checkin", id = i1, nonce = 1))
   check("tapping Started checks in", grepl("Checked in", output$cards$html))
@@ -282,11 +238,10 @@ testServer(mod_results_server, args = list(schedule = sch, view = "mine", con = 
   }
   i2 <- bid(con, "R001", "2026-11-07")
   session$setInputs(action = list(type = "cant", id = i2, nonce = 2))
-  check("Can't make it offers alternatives", is.data.frame(options()) && nrow(options()) > 0)
-  session$setInputs(alt = "1", do_move = 1)
-  check("Move from the dialog works", status_of(con, i2) == "moved" &&
-        grepl("Changes left: 2 of 3", output$summary$html))
-  check("queue box shown", grepl("queue|used both", output$queue_box$html))
+  check("Can't make it asks about that slot", identical(pending(), i2))
+  session$setInputs(do_release = 1)
+  check("Cancelling from the dialog works", status_of(con, i2) == "released" &&
+        grepl("last 30 days: 1 \\(3 allowed\\)", output$summary$html))
   sch(NULL); session$flushReact()              # new app session: Admin reactive is NULL again
   check("Admin back to NULL (e.g. app restarted): published slots still show",
         published() && grepl("Sat 07 Nov|Tue 03 Nov", output$cards$html))

@@ -1,7 +1,8 @@
 # Schedule optimiser and slot rules (ompr + GLPK).
 #
 # run_optimiser(survey, free_windows, config, cycle_start, last_planned = NULL,
-#               weights = default_weights(), time_limit = 50, verbose = TRUE)
+#               weights = default_weights(), time_limit = 50, verbose = TRUE,
+#               slots_lost = NULL)
 #   Takes: survey       - data.frame in the survey format (CLAUDE.md)
 #          free_windows - data.frame(resident_id, date, from, to) from
 #                         build_free_windows(): when each person is free
@@ -13,35 +14,25 @@
 #                         previous cycle, for the 4-5 day gap across cycles
 #          weights      - objective weights, see default_weights()
 #          time_limit   - seconds GLPK may spend on each hostel block
+#          slots_lost   - optional data.frame(resident_id, slots_lost) from
+#                         slot_penalties(): how many of their 2 slots each
+#                         person loses this cycle. Someone losing 2 gets none.
 #   Returns: list(
 #     schedule    = data.frame(person, machine, date, start, end), the
 #                   schedule format in CLAUDE.md, one row per booking,
 #     underserved = data.frame(person, name, block, slots_cap, slots_given,
-#                   reason), everyone who got fewer than 2 bookings,
+#                   reason), everyone who got fewer bookings than their
+#                   allowance (slots_cap, which already takes off slots_lost),
 #     status      = list(code, message, per_block), code is "optimal",
 #                   "not proven optimal" (a block hit the time limit or
 #                   failed) or "error",
 #     diagnostics = list(candidates, variables, constraints, build_s,
-#                   solve_s, objective, utilisation, gap_relaxed, per_block))
+#                   solve_s, objective, utilisation, gap_relaxed, penalised,
+#                   per_block), penalised is data.frame(resident_id, slots_cap)
+#                   of everyone with a reduced allowance.
 #
 # optimise_schedule(survey, free_windows, config, cycle_start, last_planned)
 #   Same inputs. Returns only the schedule data.frame.
-#
-# find_alternative_slots(booking, bookings, survey, free_windows, config,
-#                        cycle_start, now = Sys.time(), n = 5)
-#   Takes: booking  - the one schedule row the person wants to change
-#          bookings - all active bookings (schedule format), including it
-#   Returns: up to n alternative slots for that person (schedule format plus
-#            score), best first. Nobody else is moved.
-#
-# pick_from_queue(released, queue, bookings, survey, free_windows, config,
-#                 cycle_start, now = Sys.time())
-#   Takes: released - the released schedule row (machine, date, start)
-#          queue    - data.frame(person, requested_at) of waiting requests
-#          bookings - all active bookings (schedule format), without the
-#                     released one
-#   Returns: list(person, booking, reason). person is NA when the slot
-#            should go on the "Free now" list instead.
 #
 # How the model works
 #   Time: each open date of the cycle is cut into blocks of grid_min
@@ -64,24 +55,23 @@
 #   hours        list(open, close, days, buffer_min)
 #   rules        named list of the rules,* rows in config.csv
 #   out_of_order character vector of machine ids, e.g. "C-2"
-#   bands        data.frame(band, from, to), times as "HH:MM"
 
 library(dplyr)
 library(ompr)
 library(ompr.roi)
 library(ROI.plugin.glpk)
 
-# Agreed rule: everyone gets 2 bookings per cycle. The gap constraints in
-# build_model() are written for exactly 2.
+# Agreed rule: everyone gets 2 bookings per cycle, less any slots lost to
+# penalties. The gap constraints in build_model() are written for at most 2.
 SLOTS_PER_CYCLE <- 2L
 
 # Objective weights.
-#   pref:   value of one preference point (scores are 1, 2 or 3).
+#   pref:   value of one preference point (scores are 1 or 2).
 #   peak:   cost of one booked machine-minute above peak_target in an hour.
 #   assign: value of one booking. NULL means "set automatically" to
-#           2 * pref * A_max + peak * A_max * longest booking minutes + 1,
+#           pref * A_max + peak * A_max * longest booking minutes + 1,
 #           where A_max is the most bookings the block could get. Swapping
-#           bookings around can raise total preference by at most 2 per
+#           bookings around can raise total preference by at most 1 per
 #           booking and lower total overload by at most the booked minutes,
 #           so with this value one extra booking always beats any preference
 #           or peak gain: nobody loses a booking to improve someone else's
@@ -98,10 +88,10 @@ optimise_schedule <- function(survey, free_windows, config, cycle_start,
 
 run_optimiser <- function(survey, free_windows, config, cycle_start,
                           last_planned = NULL, weights = default_weights(),
-                          time_limit = 50, verbose = TRUE) {
+                          time_limit = 50, verbose = TRUE, slots_lost = NULL) {
   result <- tryCatch(
     run_optimiser_unsafe(survey, free_windows, config, cycle_start,
-                         last_planned, weights, time_limit),
+                         last_planned, weights, time_limit, slots_lost),
     error = function(e) {
       list(
         schedule = empty_schedule(),
@@ -120,10 +110,11 @@ run_optimiser <- function(survey, free_windows, config, cycle_start,
 }
 
 run_optimiser_unsafe <- function(survey, free_windows, config, cycle_start,
-                                 last_planned, weights, time_limit) {
+                                 last_planned, weights, time_limit,
+                                 slots_lost = NULL) {
   cfg <- normalise_config(config)
   grid <- generate_grid(cfg, cycle_start)
-  people <- prepare_people(survey, cfg, grid, last_planned)
+  people <- prepare_people(survey, cfg, grid, last_planned, slots_lost)
   candidates <- build_candidates(people, free_windows, cfg, grid)
   people <- mark_gap_relaxed(people, candidates, cfg)
 
@@ -153,7 +144,8 @@ run_optimiser_unsafe <- function(survey, free_windows, config, cycle_start,
              " were not solved to optimality (see per_block). "),
     nrow(schedule), " bookings for ", n_distinct(schedule$person), " of ",
     nrow(people), " people; ", nrow(underserved),
-    " people got fewer than ", SLOTS_PER_CYCLE, "."
+    " people got fewer than their allowance; ",
+    sum(people$cap < SLOTS_PER_CYCLE), " penalised."
   )
 
   list(
@@ -169,6 +161,8 @@ run_optimiser_unsafe <- function(survey, free_windows, config, cycle_start,
       objective = sum(per_block$objective, na.rm = TRUE),
       utilisation = utilisation(booked, cfg, grid),
       gap_relaxed = people$resident_id[people$gap_relaxed],
+      penalised = as.data.frame(select(filter(people, cap < SLOTS_PER_CYCLE),
+                                       resident_id, slots_cap = cap)),
       per_block = per_block
     )
   )
@@ -189,7 +183,6 @@ normalise_config <- function(config) {
     h <- get("hours")
     h <- setNames(as.list(h$value), h$key)
     r <- get("rules")
-    bands <- get("band")
     config <- list(
       machines = data.frame(block = m$key, n_machines = as.integer(m$value)),
       programs = data.frame(program = p$key, duration_min = as.numeric(p$value)),
@@ -197,12 +190,7 @@ normalise_config <- function(config) {
                    days = strsplit(h$days, ";")[[1]],
                    buffer_min = h$buffer_min),
       rules = setNames(as.list(r$value), r$key),
-      out_of_order = get("out_of_order")$key,
-      bands = data.frame(
-        band = bands$key,
-        from = sub("-.*", "", bands$value),
-        to = sub(".*-", "", bands$value)
-      )
+      out_of_order = get("out_of_order")$key
     )
   }
 
@@ -213,12 +201,6 @@ normalise_config <- function(config) {
   rules <- config$rules
   days <- config$hours$days
   if (length(days) == 1) days <- strsplit(days, ";")[[1]]
-  bands <- config$bands
-  if (is.null(bands) || nrow(bands) == 0) {
-    bands <- data.frame(band = character(), from = numeric(), to = numeric())
-  } else {
-    bands <- mutate(bands, from = hm_to_min(from), to = hm_to_min(to))
-  }
 
   list(
     machines = mutate(config$machines, block = as.character(block),
@@ -232,21 +214,23 @@ normalise_config <- function(config) {
     cycle_days = opt(rules$cycle_days, 10),
     gap_min = opt(rules$gap_min_days, 4),
     gap_max = opt(rules$gap_max_days, 5),
-    queue_min_lead = opt(rules$queue_min_lead_min, 60),
     reserve_share = opt(rules$reserve_share, 0),
     peak_target = opt(rules$peak_target, NA),
-    out_of_order = as.character(config$out_of_order),
-    bands = bands
+    out_of_order = as.character(config$out_of_order)
   )
 }
 
 # Adds program duration, booking length in blocks, the cap and the previous
 # cycle's last planned day (as a day number of this cycle, so 0 or less) to
-# each person. People whose block or program is not in config are marked
-# not valid.
-prepare_people <- function(survey, cfg, grid, last_planned = NULL) {
+# each person. The cap is 2 less any slots lost to penalties. People whose
+# block or program is not in config are marked not valid.
+prepare_people <- function(survey, cfg, grid, last_planned = NULL, slots_lost = NULL) {
   if (!"pref_days" %in% names(survey)) survey$pref_days <- NA_character_
-  if (!"pref_band" %in% names(survey)) survey$pref_band <- NA_character_
+  lost <- data.frame(resident_id = character(), lost = numeric())
+  if (!is.null(slots_lost) && nrow(slots_lost) > 0) {
+    lost <- transmute(slots_lost, resident_id = as.character(resident_id),
+                      lost = as.numeric(slots_lost))
+  }
   last <- data.frame(resident_id = character(), last_idx = numeric())
   if (!is.null(last_planned) && nrow(last_planned) > 0) {
     last <- last_planned |>
@@ -260,9 +244,10 @@ prepare_people <- function(survey, cfg, grid, last_planned = NULL) {
     distinct(resident_id, .keep_all = TRUE) |>
     left_join(cfg$programs, by = "program") |>
     left_join(last, by = "resident_id") |>
+    left_join(lost, by = "resident_id") |>
     mutate(
       cells = grid$cells_needed(duration_min),
-      cap = SLOTS_PER_CYCLE,
+      cap = pmax(SLOTS_PER_CYCLE - coalesce(lost, 0), 0),
       gap_relaxed = FALSE,
       valid = block %in% cfg$machines$block & !is.na(duration_min),
       problem = case_when(
@@ -340,10 +325,9 @@ generate_grid <- function(cfg, cycle_start) {
 #     person's, so it may run past the end of the window,
 #   - it is at least gap_min days after the person's last planned booking of
 #     the previous cycle.
-# Preference score: 3 = preferred weekday and start in preferred band,
-# 2 = one of the two, 1 = neither but the person is free.
+# Preference score: 2 = preferred weekday, 1 = any other day the person is free.
 build_candidates <- function(people, free_windows, cfg, grid) {
-  ok <- filter(people, valid, grid$working[block] > 0)
+  ok <- filter(people, valid, cap > 0, grid$working[block] > 0)
   windows <- free_windows |>
     transmute(
       resident_id = as.character(resident_id),
@@ -371,17 +355,13 @@ build_candidates <- function(people, free_windows, cfg, grid) {
     distinct()
 
   ok |>
-    select(resident_id, block, duration_min, cells, pref_days, pref_band) |>
+    select(resident_id, block, duration_min, cells, pref_days) |>
     inner_join(starts, by = "resident_id") |>
     left_join(grid$dates, by = "date") |>
-    left_join(rename(cfg$bands, band_from = from, band_to = to),
-              by = c("pref_band" = "band")) |>
     mutate(
       start_min = grid$cell_start(s),
       end_min = start_min + duration_min,
-      pref_day = in_day_list(weekday, pref_days),
-      pref_time = !is.na(band_from) & start_min >= band_from & start_min < band_to,
-      score = 1L + pref_day + pref_time
+      score = 1L + in_day_list(weekday, pref_days)
     ) |>
     arrange(block, resident_id, day_idx, s) |>
     mutate(id = row_number()) |>
@@ -495,7 +475,8 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
     person <- people[people$resident_id == p$resident_id[1], ]
     on <- function(days) p$k[p$day_idx %in% days]
 
-    # SLOT CAP: each person gets at most 2 bookings in the cycle.
+    # SLOT CAP: each person gets at most 2 bookings in the cycle, or 1 if they
+    # lost a slot to a penalty.
     if (nrow(p) > person$cap) rows <- add_row(rows, p$k, rep(1, nrow(p)), person$cap)
 
     # MINIMUM GAP: in any gap_min consecutive days a person has at most one
@@ -564,7 +545,7 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
   # Objective weights; see default_weights().
   a_max <- sum(people$cap)
   assign_w <- weights$assign
-  auto_w <- 2 * weights$pref * a_max +
+  auto_w <- weights$pref * a_max +
     weights$peak * a_max * max(cand$cells) * g + 1
   if (is.null(assign_w)) {
     assign_w <- auto_w
@@ -866,148 +847,6 @@ print_diagnostics <- function(result) {
     cat("  previous-cycle gap relaxed for:", paste(d$gap_relaxed, collapse = ", "), "\n")
   }
   invisible()
-}
-
-# ---------------------------------------------------------------------------
-# Changes and released slots
-# ---------------------------------------------------------------------------
-
-# Turns schedule-format bookings into rows with block, day_idx, start block
-# and blocks held, for occupancy checks.
-bookings_occupancy <- function(bookings, cfg, grid) {
-  if (nrow(bookings) == 0) {
-    return(data.frame(person = character(), machine = character(),
-                      block = character(), date = as.Date(character()),
-                      s = numeric(), cells = numeric()))
-  }
-  bookings |>
-    mutate(person = as.character(person), date = as.Date(date)) |>
-    left_join(select(grid$machines, machine, block), by = "machine") |>
-    mutate(
-      s = (hm_to_min(start) - cfg$open) / cfg$grid_min,
-      cells = grid$cells_needed(hm_to_min(end) - hm_to_min(start))
-    ) |>
-    select(person, machine, block, date, s, cells)
-}
-
-# TRUE if `machine` has no booking overlapping blocks s .. s + cells - 1 on
-# `date`.
-machine_free <- function(occ, machine, date, s, cells) {
-  o <- occ[occ$machine == machine & occ$date == date, ]
-  all(o$s + o$cells <= s | o$s >= s + cells)
-}
-
-# TRUE if adding `minutes` to the block's bookings on `date` keeps the
-# emergency reserve free.
-reserve_ok <- function(occ, block, date, minutes, cfg, grid) {
-  used <- sum(occ$cells[occ$block == block & occ$date == date]) * cfg$grid_min
-  cap <- floor((1 - cfg$reserve_share) * grid$working[[block]] * grid$n_cells * cfg$grid_min)
-  used + minutes <= cap
-}
-
-slot_time <- function(date, minutes) {
-  as.POSIXct(paste(format(as.Date(date)), min_to_hm(minutes)), format = "%Y-%m-%d %H:%M")
-}
-
-# Alternatives for one booking the person wants to change. Same rules as
-# the optimiser (own block, working machine, opening hours, whole wash
-# inside free time, machine free including buffers, emergency reserve, a
-# date with none of their other bookings), except the 4-5 day gap, which a
-# change may bend. Only slots starting after `now` are offered. Nobody else
-# is moved. Best first: preference score, then closest date and time to the
-# original slot.
-find_alternative_slots <- function(booking, bookings, survey, free_windows,
-                                   config, cycle_start, now = Sys.time(), n = 5) {
-  cfg <- normalise_config(config)
-  grid <- generate_grid(cfg, cycle_start)
-  who <- as.character(booking$person)
-  person <- prepare_people(filter(survey, resident_id == who), cfg, grid)
-  cand <- build_candidates(person, filter(free_windows, resident_id == who), cfg, grid)
-  if (nrow(cand) == 0) return(mutate(empty_schedule(), score = integer()))
-
-  is_this <- bookings$person == who & bookings$machine == booking$machine &
-    as.Date(bookings$date) == as.Date(booking$date) & bookings$start == booking$start
-  occ <- bookings_occupancy(bookings[!is_this, ], cfg, grid)
-  own_dates <- occ$date[occ$person == who]
-  working <- filter(grid$machines, in_order, block == person$block)
-
-  cand <- cand |>
-    filter(!date %in% own_dates, slot_time(date, start_min) > now)
-  cand$machine <- vapply(seq_len(nrow(cand)), function(i) {
-    for (m in working$machine) {
-      if (machine_free(occ, m, cand$date[i], cand$s[i], cand$cells[i])) return(m)
-    }
-    NA_character_
-  }, character(1))
-  cand <- cand[!is.na(cand$machine), ]
-  cand <- cand[vapply(seq_len(nrow(cand)), function(i) {
-    reserve_ok(occ, cand$block[i], cand$date[i], cand$cells[i] * cfg$grid_min, cfg, grid)
-  }, logical(1)), ]
-
-  original <- as.Date(booking$date)
-  cand |>
-    mutate(
-      date_dist = abs(as.numeric(date - original)),
-      time_dist = abs(start_min - hm_to_min(booking$start))
-    ) |>
-    arrange(desc(score), date_dist, time_dist, date, s) |>
-    slice_head(n = n) |>
-    transmute(person = resident_id, machine, date = format(date),
-              start = min_to_hm(start_min), end = min_to_hm(end_min), score) |>
-    as.data.frame()
-}
-
-# Who in the queue gets a released slot. If it starts within
-# queue_min_lead_min of `now`, nobody: it goes on the "Free now" list.
-# Otherwise the first eligible person, where eligible means: same block as
-# the machine, their whole booking (program + buffer) fits on that machine
-# from the released start without overlapping anyone, their wash is inside
-# their free time, they have no other booking that date, and the emergency
-# reserve stays free. Order: people with fewer than 2 bookings this cycle
-# first, then earliest request, then resident_id.
-pick_from_queue <- function(released, queue, bookings, survey, free_windows,
-                            config, cycle_start, now = Sys.time()) {
-  cfg <- normalise_config(config)
-  grid <- generate_grid(cfg, cycle_start)
-  start_min <- hm_to_min(released$start)
-  date <- as.Date(released$date)
-  lead <- as.numeric(difftime(slot_time(date, start_min), now, units = "mins"))
-  if (lead < cfg$queue_min_lead) {
-    return(list(person = NA_character_, booking = NULL,
-                reason = "starts too soon for the queue: put it on the Free now list"))
-  }
-
-  block <- grid$machines$block[grid$machines$machine == released$machine]
-  occ <- bookings_occupancy(bookings, cfg, grid)
-  occ <- occ[!(occ$machine == released$machine & occ$date == date &
-                 occ$s == (start_min - cfg$open) / cfg$grid_min), ]
-  in_cycle <- occ[occ$date >= grid$start & occ$date < grid$start + cfg$cycle_days, ]
-  s <- (start_min - cfg$open) / cfg$grid_min
-
-  order <- queue |>
-    mutate(person = as.character(person)) |>
-    left_join(count(in_cycle, person, name = "have"), by = "person") |>
-    mutate(have = coalesce(have, 0L), short = have < SLOTS_PER_CYCLE) |>
-    arrange(desc(short), requested_at, person)
-
-  people <- prepare_people(survey, cfg, grid)
-  for (p in order$person) {
-    person <- people[people$resident_id == p, ]
-    if (nrow(person) == 0 || !person$valid || person$block != block) next
-    if (date %in% occ$date[occ$person == p]) next
-    if (s + person$cells > grid$n_cells) next
-    end_min <- start_min + person$duration_min
-    fw <- free_windows[free_windows$resident_id == p & as.Date(free_windows$date) == date, ]
-    if (!any(hm_to_min(fw$from) <= start_min & hm_to_min(fw$to) >= end_min)) next
-    if (!machine_free(occ, released$machine, date, s, person$cells)) next
-    if (!reserve_ok(occ, block, date, person$cells * cfg$grid_min, cfg, grid)) next
-    booking <- data.frame(person = p, machine = released$machine,
-                          date = format(date), start = min_to_hm(start_min),
-                          end = min_to_hm(end_min))
-    return(list(person = p, booking = booking, reason = "first eligible person in the queue"))
-  }
-  list(person = NA_character_, booking = NULL,
-       reason = "nobody in the queue fits: put it on the Free now list")
 }
 
 # ---------------------------------------------------------------------------

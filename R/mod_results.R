@@ -25,27 +25,24 @@
 #   Returns: nothing (output only).
 #
 # My slots ("mine"): the resident's bookings this cycle; "Started" check-in
-#   (from slot start to checkin_grace_min after); "Can't make it" (move to
-#   another slot up to change_cutoff_hours before, or release it any time
-#   before it starts; both count towards max_changes per changes_window_days);
+#   (from slot start to checkin_grace_min after); "Can't make it" cancels the
+#   slot up to cancel_cutoff_hours before it starts, making it a free slot;
 #   "Finished" after checking in (check_out()); then a 1-5 star rating with an
 #   optional comment (add_feedback()), which can be skipped and given later;
-#   changes left and no-shows; join or leave the extra-slot queue.
+#   cancellations and no-shows in the last penalty_window_days, and any slots
+#   lost this cycle.
 # Schedule ("all"): every machine by date, coloured by status, and the
-#   "Free now" list of released slots anyone eligible can claim.
+#   "Free now" list of cancelled slots anyone eligible can claim. A missed slot
+#   is a no-show and is not offered to anyone.
 #
-# All rules follow CLAUDE.md "Scheduling rules" and "Changes, check-in and
-# the queue". Rule values come from data/config.csv via load_config().
+# All rules follow CLAUDE.md "Scheduling rules" and "Cancellations, no-shows
+# and free slots". Rule values come from data/config.csv via load_config().
 #
 # Uses from other files (all optional except the R/data_load.R helpers):
 #   R/data_load.R  load_config, load_survey, load_timetable,
 #                  build_free_windows, db_connect, read_responses,
 #                  read_bookings, add_bookings, set_booking_status,
-#                  read_changes, add_change, read_queue, add_to_queue,
-#                  set_queue_status
-#   R/optimiser.R  find_alternative_slots, pick_from_queue. Until they exist,
-#                  res_find_alternatives() and res_pick_from_queue() below
-#                  are used: they apply the same rules.
+#                  read_changes, add_change, slot_penalties
 #   R/mod_questionnaire.R  PATH_SURVEY, PATH_TIMETABLE, PATH_CONFIG (the
 #                  files the Admin page uses), if defined.
 #
@@ -55,25 +52,15 @@
 #
 # Every function and constant here starts with res_ / RES_ so nothing clashes
 # with the other files, which are all sourced into the same environment.
-#
-# Choices made here that the team may want to confirm:
-#   - Joining the extra-slot queue: allowed once you have used (checked into)
-#     both slots this cycle, or if you hold fewer than 2 (e.g. released one).
-#   - A moved or released slot is freed machine time: it is offered to the
-#     queue, otherwise it shows under "Free now".
-#   - After 3 no-shows nothing happens yet (open decision 1); the count is
-#     shown.
 
 # ---- Settings ----------------------------------------------------------------
 
-RES_DEFAULTS <- list(checkin_grace_min = 15, change_cutoff_hours = 6,
-                     max_changes = 3, changes_window_days = 30,
-                     queue_min_lead_min = 60, reserve_share = 0,
-                     buffer_min = 10, grid_min = 30, cycle_days = 10,
-                     slots_per_cycle = 2)
+RES_DEFAULTS <- list(checkin_grace_min = 15, cancel_cutoff_hours = 6,
+                     max_cancellations = 3, max_no_shows = 2,
+                     penalty_window_days = 30, reserve_share = 0,
+                     buffer_min = 10, grid_min = 30, cycle_days = 10)
 RES_ACTIVE <- c("booked", "checked_in", "finished")  # hold the machine / count as a booking
-RES_USED   <- c("checked_in", "finished")            # the resident actually washed
-RES_FREED  <- c("released", "moved")          # statuses that free it again
+RES_FREED  <- "released"                             # free for anyone to claim
 
 res_path <- function(name, fallback) {
   if (exists(name)) get(name) else fallback
@@ -186,16 +173,22 @@ res_expire_no_shows <- function(con, now, s) {
 
 # ---- Counts ----------------------------------------------------------------------
 
-res_changes_used <- function(con, person, now, s) {
+# Cancellations and no-shows in the last penalty_window_days.
+res_cancellations <- function(con, person, now, s) {
   ch <- read_changes(con, person)
+  ch <- ch[ch$kind == "release", ]
   if (nrow(ch) == 0) return(0)
-  at <- as.POSIXct(ch$at)
-  sum(at > now - s$changes_window_days * 86400)
+  sum(as.POSIXct(ch$at) > now - s$penalty_window_days * 86400)
 }
-res_changes_left <- function(con, person, now, s) {
-  max(0, s$max_changes - res_changes_used(con, person, now, s))
+res_no_shows <- function(b, person, now, s) {
+  sum(b$person == person & b$status == "no_show" &
+        b$start_dt > now - s$penalty_window_days * 86400)
 }
-res_no_shows <- function(b, person) sum(b$person == person & b$status == "no_show")
+# Slots this person lost in the given cycle.
+res_slots_lost <- function(con, config, person, cycle_start, now) {
+  p <- slot_penalties(con, cycle_start, config, now)
+  sum(p$slots_lost[p$resident_id == person])
+}
 
 # ---- Rule checks: each returns list(ok, why) -------------------------------------
 
@@ -207,22 +200,17 @@ res_checkin_status <- function(bk, now, s) {
   list(ok = TRUE, why = paste("Tap Started before", format(closes, "%H:%M")))
 }
 
-# What "Can't make it" allows: "change" (move or release), "release" (only
-# release: under change_cutoff_hours before), or "none".
-res_change_status <- function(bk, now, s, changes_left) {
-  if (bk$status != "booked") return(list(ok = FALSE, mode = "none", why = ""))
-  if (now >= bk$start_dt) return(list(ok = FALSE, mode = "none", why = "Slot has started"))
-  if (changes_left <= 0) {
-    return(list(ok = FALSE, mode = "none",
-                why = sprintf("No changes left (%g per %g days)", s$max_changes,
-                              s$changes_window_days)))
+# Can "Can't make it" cancel this slot? Only up to cancel_cutoff_hours before
+# it starts. After that, not checking in makes it a no-show.
+res_cancel_status <- function(bk, now, s) {
+  if (bk$status != "booked") return(list(ok = FALSE, why = ""))
+  if (now >= bk$start_dt) return(list(ok = FALSE, why = "Slot has started"))
+  if (now > bk$start_dt - s$cancel_cutoff_hours * 3600) {
+    return(list(ok = FALSE,
+                why = sprintf("Under %g h to go: it can't be cancelled, and missing it counts as a no-show",
+                              s$cancel_cutoff_hours)))
   }
-  if (now > bk$start_dt - s$change_cutoff_hours * 3600) {
-    return(list(ok = TRUE, mode = "release",
-                why = sprintf("Under %g h to go: you can release it but not move it",
-                              s$change_cutoff_hours)))
-  }
-  list(ok = TRUE, mode = "change", why = "")
+  list(ok = TRUE, why = "")
 }
 
 # Is machine time [from, to) free on that machine and date? (minutes)
@@ -266,99 +254,6 @@ res_why_not <- function(person, machine, date, start, active, survey, fw, s) {
     return("Would use the emergency reserve")
   }
   ""
-}
-
-# ---- Alternatives and queue (stand-ins until R/optimiser.R has them) -------------
-
-# Same rules as optimiser.R's find_alternative_slots(): own block, working
-# machine, opening hours, whole wash in free time, machine free with buffer,
-# emergency reserve, a date without their other bookings, starts after now.
-# The 4-5 day gap does not apply to a change.
-res_find_alternatives <- function(booking, active, survey, fw, s, cycle_start, now, n = 5) {
-  who <- booking$person
-  others <- active[!(active$booking_id %in% booking$booking_id), ]
-  dates <- cycle_start + seq_len(s$cycle_days) - 1
-  dates <- dates[format(dates, "%a") %in% s$days]
-  starts <- seq(s$open, s$close - s$grid_min, by = s$grid_min)
-  out <- list()
-  for (d in as.list(dates)) for (st in starts) for (m in s$machines$machine) {
-    if (res_dt(d, res_hhmm(st)) <= now) next
-    if (m == booking$machine && format(d) == booking$date && res_hhmm(st) == booking$start) next
-    if (res_why_not(who, m, d, res_hhmm(st), others, survey, fw, s) != "") next
-    dur <- s$programs[survey$program[survey$resident_id == who][1]]
-    out[[length(out) + 1]] <- data.frame(person = who, machine = m, date = format(d),
-                                         start = res_hhmm(st), end = res_hhmm(st + dur))
-  }
-  if (length(out) == 0) {
-    return(data.frame(person = character(), machine = character(), date = character(),
-                      start = character(), end = character()))
-  }
-  out <- do.call(rbind, out)
-  dist <- abs(as.numeric(as.Date(out$date) - as.Date(booking$date))) * 10000 +
-    abs(res_min(out$start) - res_min(booking$start))
-  out <- out[order(dist), ]
-  out <- out[!duplicated(paste(out$date, out$start)), ]   # one machine per time
-  rownames(out) <- NULL
-  head(out, n)
-}
-
-# Same rules and order as optimiser.R's pick_from_queue().
-res_pick_from_queue <- function(released, queue, active, survey, fw, s, cycle_start, now) {
-  lead <- as.numeric(difftime(res_dt(released$date, released$start), now, units = "mins"))
-  if (lead < s$queue_min_lead_min) {
-    return(list(person = NA_character_, booking = NULL, reason = "starts too soon"))
-  }
-  cyc <- active[res_in_cycle(active$date, cycle_start, s), ]
-  have <- vapply(queue$person, function(p) sum(cyc$person == p), numeric(1))
-  queue <- queue[order(have >= s$slots_per_cycle, queue$requested_at, queue$person), ]
-  for (p in queue$person) {
-    if (res_why_not(p, released$machine, released$date, released$start,
-                    active, survey, fw, s) != "") next
-    dur <- s$programs[survey$program[survey$resident_id == p][1]]
-    booking <- data.frame(person = p, machine = released$machine, date = released$date,
-                          start = released$start,
-                          end = res_hhmm(res_min(released$start) + dur))
-    return(list(person = p, booking = booking, reason = "first eligible person in the queue"))
-  }
-  list(person = NA_character_, booking = NULL, reason = "nobody in the queue fits")
-}
-
-# Use Person 1's helpers when R/optimiser.R has them. Someone who can't make
-# a time doesn't want the same time on another machine, so alternatives that
-# overlap the original slot on the same date are left out.
-res_alternatives <- function(ctx, booking, n = 5) {
-  alt <- NULL
-  if (exists("find_alternative_slots", mode = "function")) {
-    alt <- tryCatch(
-      find_alternative_slots(booking[, c("person", "machine", "date", "start", "end")],
-                             ctx$active[, c("person", "machine", "date", "start", "end")],
-                             ctx$survey, ctx$fw, ctx$config, ctx$cycle_start,
-                             now = ctx$now, n = n + 20),
-      error = function(e) NULL)
-  }
-  if (!is.data.frame(alt)) {
-    alt <- res_find_alternatives(booking, ctx$active, ctx$survey, ctx$fw, ctx$s,
-                                 ctx$cycle_start, ctx$now, n + 20)
-  }
-  overlaps <- alt$date == booking$date &
-    res_min(alt$start) < res_min(booking$end) & res_min(alt$end) > res_min(booking$start)
-  alt <- alt[!overlaps, , drop = FALSE]
-  rownames(alt) <- NULL
-  head(alt, n)
-}
-
-res_pick <- function(ctx, released, queue) {
-  if (exists("pick_from_queue", mode = "function")) {
-    others <- ctx$active
-    pick <- tryCatch(
-      pick_from_queue(released[, c("machine", "date", "start")], queue,
-                      others[, c("person", "machine", "date", "start", "end")],
-                      ctx$survey, ctx$fw, ctx$config, ctx$cycle_start, now = ctx$now),
-      error = function(e) NULL)
-    if (is.list(pick)) return(pick)
-  }
-  res_pick_from_queue(released, queue, ctx$active, ctx$survey, ctx$fw, ctx$s,
-                      ctx$cycle_start, ctx$now)
 }
 
 # ---- Context: everything one action needs, read fresh --------------------------
@@ -464,57 +359,18 @@ res_rate <- function(ctx, booking_id, person, rating, comment = NA) {
   list(ok = TRUE, msg = "Thanks for your feedback!")
 }
 
-# Freed machine time goes to the first eligible person in the queue.
-res_offer_to_queue <- function(ctx, freed) {
-  q <- read_queue(ctx$con, "waiting")
-  if (nrow(q) == 0) return(NA_character_)
-  pick <- res_pick(ctx, freed, q)
-  if (is.na(pick$person)) return(NA_character_)
-  add_bookings(ctx$con, pick$booking, source = "queue")
-  set_queue_status(ctx$con, pick$person, "served")
-  pick$person
-}
-
 res_release <- function(ctx, booking_id, person) {
   bk <- res_my_booking(ctx, booking_id, person)
   if (nrow(bk) != 1) return(list(ok = FALSE, msg = "Booking not found."))
-  st <- res_change_status(bk, ctx$now, ctx$s, res_changes_left(ctx$con, person, ctx$now, ctx$s))
+  st <- res_cancel_status(bk, ctx$now, ctx$s)
   if (!st$ok) return(list(ok = FALSE, msg = st$why))
   set_booking_status(ctx$con, booking_id, "released")
   add_change(ctx$con, person, booking_id, "release", at = ctx$now)
-  ctx$active <- ctx$active[ctx$active$booking_id != booking_id, ]
-  to <- res_offer_to_queue(ctx, bk)
-  list(ok = TRUE, msg = if (is.na(to)) "Slot released. Others can now claim it."
-                        else "Slot released and given to someone in the queue.")
+  list(ok = TRUE, msg = "Slot cancelled. It's now a free slot anyone can claim.")
 }
 
-res_move <- function(ctx, booking_id, person, new_slot) {
-  bk <- res_my_booking(ctx, booking_id, person)
-  if (nrow(bk) != 1) return(list(ok = FALSE, msg = "Booking not found."))
-  st <- res_change_status(bk, ctx$now, ctx$s, res_changes_left(ctx$con, person, ctx$now, ctx$s))
-  if (!st$ok || st$mode != "change") {
-    return(list(ok = FALSE, msg = if (st$why != "") st$why else "This slot can't be moved."))
-  }
-  others <- ctx$active[ctx$active$booking_id != booking_id, ]
-  why <- res_why_not(person, new_slot$machine, new_slot$date, new_slot$start,
-                     others, ctx$survey, ctx$fw, ctx$s)
-  if (why != "") return(list(ok = FALSE, msg = paste("That slot is no longer possible:", why)))
-  if (res_dt(new_slot$date, new_slot$start) <= ctx$now) {
-    return(list(ok = FALSE, msg = "That slot has already started."))
-  }
-  add_bookings(ctx$con, new_slot[, c("person", "machine", "date", "start", "end")],
-               source = "change")
-  set_booking_status(ctx$con, booking_id, "moved")
-  add_change(ctx$con, person, booking_id, "change", at = ctx$now)
-  ctx$active <- res_bookings(ctx$con, ctx$s)
-  ctx$active <- ctx$active[ctx$active$status %in% RES_ACTIVE, ]
-  res_offer_to_queue(ctx, bk)
-  list(ok = TRUE, msg = paste("Moved to", res_label(new_slot$date, new_slot$start,
-                                                    new_slot$end, new_slot$machine)))
-}
-
-# Released or moved slots that start in the future and whose machine time is
-# still free, with why_not for `person` ("" = they can claim it).
+# Cancelled slots that start in the future and whose machine time is still
+# free, with why_not for `person` ("" = they can claim it).
 res_free_now <- function(ctx, person) {
   b <- ctx$bookings
   f <- b[b$status %in% RES_FREED & b$start_dt > ctx$now, ]
@@ -531,7 +387,6 @@ res_free_now <- function(ctx, person) {
     res_why_not(person, f$machine[i], f$date[i], f$start[i], ctx$active,
                 ctx$survey, ctx$fw, ctx$s)
   }, character(1))
-  f$soon <- f$start_dt <= ctx$now + ctx$s$queue_min_lead_min * 60
   f
 }
 
@@ -544,65 +399,18 @@ res_claim <- function(ctx, booking_id, person) {
   new <- data.frame(person = person, machine = slot$machine, date = slot$date,
                     start = slot$start, end = res_hhmm(res_min(slot$start) + dur))
   add_bookings(ctx$con, new, source = "free_now")
-  if (person %in% read_queue(ctx$con, "waiting")$person) {
-    set_queue_status(ctx$con, person, "served")
-  }
   list(ok = TRUE, msg = sprintf("It's yours: %s.", res_label(new$date, new$start, new$end,
                                                              new$machine)))
-}
-
-# Queue: "waiting" (with position), "can_join" or "not_yet" (with why).
-res_queue_status <- function(ctx, person) {
-  q <- read_queue(ctx$con, "waiting")
-  cyc <- ctx$bookings[ctx$bookings$person == person &
-                        res_in_cycle(ctx$bookings$date, ctx$cycle_start, ctx$s), ]
-  if (person %in% q$person) {
-    blk <- ctx$survey$block[ctx$survey$resident_id == person][1]
-    same <- q[q$person %in% ctx$survey$resident_id[ctx$survey$block == blk], ]
-    cycb <- ctx$active[res_in_cycle(ctx$active$date, ctx$cycle_start, ctx$s), ]
-    have <- vapply(same$person, function(p) sum(cycb$person == p), numeric(1))
-    same <- same[order(have >= ctx$s$slots_per_cycle, same$requested_at, same$person), ]
-    return(list(state = "waiting", position = which(same$person == person)))
-  }
-  held <- sum(cyc$status %in% c(RES_ACTIVE, "no_show"))
-  used <- sum(cyc$status %in% RES_USED)
-  if (held < ctx$s$slots_per_cycle || used >= ctx$s$slots_per_cycle) {
-    return(list(state = "can_join"))
-  }
-  list(state = "not_yet", why = "You can join once you've used both of your slots this cycle.")
-}
-
-res_join_queue <- function(ctx, person) {
-  st <- res_queue_status(ctx, person)
-  if (st$state != "can_join") {
-    return(list(ok = FALSE, msg = if (is.null(st$why)) "Already in the queue." else st$why))
-  }
-  add_to_queue(ctx$con, person, requested_at = ctx$now)
-  # Freed slots more than queue_min_lead_min away go to the queue now.
-  f <- res_free_now(ctx, person)
-  got <- FALSE
-  for (i in seq_len(nrow(f))) {
-    if (f$soon[i]) next
-    ctx$active <- { b <- res_bookings(ctx$con, ctx$s); b[b$status %in% RES_ACTIVE, ] }
-    if (identical(res_offer_to_queue(ctx, f[i, ]), person)) { got <- TRUE; break }
-  }
-  list(ok = TRUE, msg = if (got) "You've been given a released slot. See My slots."
-                        else "You're in the queue for an extra slot.")
-}
-
-res_leave_queue <- function(ctx, person) {
-  set_queue_status(ctx$con, person, "withdrawn")
-  list(ok = TRUE, msg = "You've left the queue.")
 }
 
 # ---- UI ----------------------------------------------------------------------
 
 RES_STATUS_LABEL <- c(booked = "Booked", checked_in = "Checked in",
                       finished = "Finished", no_show = "No-show",
-                      released = "Free", moved = "Free")
+                      released = "Free")
 RES_STATUS_COLOUR <- c(booked = "#2c7fb8", checked_in = "#198754",
                        finished = "#6f42c1", no_show = "#dc3545",
-                       released = "#adb5bd", moved = "#adb5bd")
+                       released = "#adb5bd")
 
 res_css <- tags$style(HTML("
   .res-card { border:1px solid var(--bs-border-color,#dee2e6); border-radius:8px;
@@ -631,9 +439,7 @@ mod_results_ui <- function(id, view = c("mine", "all")) {
         conditionalPanel(
           "output.published", ns = ns,
           uiOutput(ns("summary")),
-          uiOutput(ns("cards")),
-          h5("Extra slot"),
-          uiOutput(ns("queue_box")))
+          uiOutput(ns("cards")))
       )
     )
   } else {
@@ -648,7 +454,7 @@ mod_results_ui <- function(id, view = c("mine", "all")) {
       "output.published", ns = ns,
       h5("Free now"),
       p(class = "res-hint", style = "margin-left:0",
-        "Released slots anyone in that block can claim, first come first served."),
+        "Cancelled slots anyone in that block can claim, first come first served."),
       uiOutput(ns("free_now")),
       hr(),
       div(style = "display:flex; gap:32px; flex-wrap:wrap; align-items:flex-end",
@@ -687,8 +493,7 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
     db_state <- reactivePoll(refresh_ms, session, function() {
       DBI::dbGetQuery(con, "SELECT
         (SELECT COUNT(*) || ':' || COALESCE(SUM(booking_id * length(status)), 0) FROM bookings)
-        || '|' || (SELECT COUNT(*) FROM changes)
-        || '|' || (SELECT COUNT(*) || ':' || COALESCE(SUM(length(status)), 0) FROM queue) AS v")$v
+        || '|' || (SELECT COUNT(*) FROM changes) AS v")$v
     }, function() TRUE)
     bump <- reactiveVal(0)
 
@@ -749,13 +554,19 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
     output$summary <- renderUI({
       x <- ctx(); p <- me()
       if (is.na(x$cycle_start)) return(NULL)
+      lost <- res_slots_lost(con, config, p, x$cycle_start, x$now)
       div(class = "res-info",
           strong(sprintf("Cycle: %s to %s", res_day(x$cycle_start),
                          res_day(x$cycle_start + x$s$cycle_days - 1))), br(),
-          sprintf("Changes left: %g of %g (each counts for %g days).",
-                  res_changes_left(con, p, x$now, x$s), x$s$max_changes,
-                  x$s$changes_window_days), br(),
-          sprintf("No-shows so far: %d.", res_no_shows(x$bookings, p)))
+          sprintf("Cancellations in the last %g days: %g (%g allowed).",
+                  x$s$penalty_window_days, res_cancellations(con, p, x$now, x$s),
+                  x$s$max_cancellations), br(),
+          sprintf("No-shows in the last %g days: %g (%g allowed).",
+                  x$s$penalty_window_days, res_no_shows(x$bookings, p, x$now, x$s),
+                  x$s$max_no_shows), br(),
+          "Going over either limit costs you one slot in the next cycle.",
+          if (lost > 0) tagList(br(), strong(sprintf(
+            "You lost %g slot(s) this cycle for going over a limit.", lost))))
     })
 
     output$cards <- renderUI({
@@ -766,13 +577,11 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
                            x$bookings$status %in% c(RES_ACTIVE, "no_show"), ]
       if (nrow(mine) == 0) return(div(class = "res-card", "You have no slots in this cycle."))
       mine <- mine[order(mine$start_dt), ]
-      left <- res_changes_left(con, p, x$now, x$s)
       lapply(seq_len(nrow(mine)), function(i) {
         bk <- mine[i, ]
         ci <- res_checkin_status(bk, x$now, x$s)
-        ch <- res_change_status(bk, x$now, x$s, left)
-        extra <- if (bk$source %in% c("queue", "free_now")) " (extra slot)" else
-                 if (bk$source == "change") " (changed)" else ""
+        ch <- res_cancel_status(bk, x$now, x$s)
+        extra <- if (bk$source == "free_now") " (free slot)" else ""
         div(class = "res-card",
             h5(sprintf("%s, %s-%s", res_day(bk$date), bk$start, bk$end),
                span(class = "res-pill", style = paste0("background:", RES_STATUS_COLOUR[[bk$status]]),
@@ -802,49 +611,26 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
       })
     })
 
-    output$queue_box <- renderUI({
-      x <- ctx(); p <- me()
-      if (is.na(x$cycle_start)) return(NULL)
-      st <- res_queue_status(x, p)
-      switch(st$state,
-        waiting = div(class = "res-card",
-                      sprintf("You're in the queue (number %d in your block). ", st$position),
-                      "A released slot that fits will appear in My slots.", br(),
-                      act("Leave queue", "leave_queue")),
-        can_join = div(class = "res-card",
-                       "Need another wash? Join the queue and you'll get the next released slot that fits.",
-                       br(), act("Join queue", "join_queue", class = "btn-primary")),
-        div(class = "res-card", st$why))
-    })
-
     # ---- "Can't make it" ----------------------------------------------------
     pending <- reactiveVal(NULL)
-    options <- reactiveVal(NULL)
 
     open_dialog <- function(booking_id) {
       x <- ctx(); p <- me()
       bk <- res_my_booking(x, booking_id, p)
       req(nrow(bk) == 1)
-      st <- res_change_status(bk, x$now, x$s, res_changes_left(con, p, x$now, x$s))
+      st <- res_cancel_status(bk, x$now, x$s)
       if (!st$ok) { done(list(ok = FALSE, msg = st$why)); return() }
-      alts <- if (st$mode == "change") res_alternatives(x, bk) else NULL
-      pending(booking_id); options(alts)
-      have_alts <- is.data.frame(alts) && nrow(alts) > 0
-      choices <- if (have_alts) setNames(as.character(seq_len(nrow(alts))),
-                                         res_label(alts$date, alts$start, alts$end, alts$machine))
+      pending(booking_id)
       showModal(modalDialog(
         title = sprintf("Can't make %s, %s-%s?", res_day(bk$date), bk$start, bk$end),
-        p(sprintf("Moving or releasing uses 1 of your %g remaining changes.",
-                  res_changes_left(con, p, x$now, x$s))),
-        if (st$mode == "release") p(em(st$why))
-        else if (have_alts) radioButtons(ns("alt"), "Move to:", choices = choices, width = "100%")
-        else p(em("No other slot fits your free time right now. You can still release it.")),
+        p(sprintf("This will be cancellation %g in the last %g days (%g allowed). Going over the limit costs you one slot in the next cycle.",
+                  res_cancellations(con, p, x$now, x$s) + 1, x$s$penalty_window_days,
+                  x$s$max_cancellations)),
         p(class = "res-hint", style = "margin-left:0",
-          "A released slot goes to someone in the queue, or to the Free now list."),
+          "The slot goes on the Free now list, where anyone can claim it."),
         footer = tagList(
           modalButton("Keep my slot"),
-          actionButton(ns("do_release"), "Release it", class = "btn-outline-danger"),
-          if (have_alts) actionButton(ns("do_move"), "Move", class = "btn-primary")
+          actionButton(ns("do_release"), "Cancel this slot", class = "btn-outline-danger")
         ),
         easyClose = TRUE))
     }
@@ -889,15 +675,7 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
         },
         rate        = open_rating(a$id),
         cant        = open_dialog(a$id),
-        claim       = done(res_claim(x, a$id, p)),
-        join_queue  = done(res_join_queue(x, p)),
-        leave_queue = done(res_leave_queue(x, p)))
-    })
-    observeEvent(input$do_move, {
-      alts <- options(); i <- as.integer(input$alt)
-      req(pending(), is.data.frame(alts), length(i) == 1, i <= nrow(alts))
-      removeModal()
-      done(res_move(ctx(), pending(), me(), alts[i, ]))
+        claim       = done(res_claim(x, a$id, p)))
     })
     observeEvent(input$do_release, {
       req(pending())
@@ -913,7 +691,6 @@ mod_results_server <- function(id, schedule = NULL, view = c("mine", "all"),
       lapply(seq_len(nrow(f)), function(i) {
         div(class = "res-card",
             strong(res_label(f$date[i], f$start[i], f$end[i], f$machine[i])),
-            if (f$soon[i]) span(class = "res-pill", style = "background:#fd7e14", "starting soon"),
             br(),
             act("Claim it", "claim", f$booking_id[i], f$why_not[i] == "", "btn-success"),
             span(class = "res-hint", f$why_not[i]))

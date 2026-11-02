@@ -119,15 +119,23 @@
 # read_changes(con, person = NULL)
 #   Returns: data.frame(person, booking_id, at, kind).
 # add_change(con, person, booking_id, kind, at = Sys.time())
-#   Takes: kind - "change" or "release". booking_id must exist.
+#   Takes: kind - "release" for a cancellation ("change" only in old data).
+#          booking_id must exist.
 #
 # read_queue(con, status = NULL)
 #   Returns: data.frame(person, requested_at, status), earliest request first.
-# add_to_queue(con, person, requested_at = Sys.time())
-#   Does nothing if the person is already waiting.
-# set_queue_status(con, person, status)
-#   Sets the person's waiting request to "served" or "withdrawn". Stops if
-#   they have none.
+#   Old data only: the queue is no longer used. The Admin page's tab still
+#   reads it until that tab is removed.
+#
+# slot_penalties(con, cycle_start, config, now = Sys.time())
+#   Takes: cycle_start - first date of the cycle (Date or "YYYY-MM-DD")
+#          config      - list from load_config(), for the penalty rules
+#          now         - booked slots whose check-in closed before this count
+#                        as no-shows, even if nobody has opened the app since
+#   Returns: data.frame(resident_id, cancellations, no_shows, slots_lost), one
+#            row per person with any in the penalty_window_days before
+#            cycle_start. slots_lost is 1 for going over max_cancellations and
+#            1 for going over max_no_shows, so 0, 1 or 2.
 #
 # clear_cycle_plan(con, cycle_start, cycle_days = 10)
 #   Deletes the cycle's optimiser bookings, so a new plan can replace them.
@@ -835,19 +843,35 @@ read_queue <- function(con, status = NULL) {
             status, "requested_at")
 }
 
-add_to_queue <- function(con, person, requested_at = Sys.time()) {
-  DBI::dbExecute(con, "INSERT OR IGNORE INTO queue (person, requested_at, status)
-                       VALUES (?, ?, 'waiting')",
-                 params = list(person, time_text(requested_at)))
-  invisible(TRUE)
-}
+slot_penalties <- function(con, cycle_start, config, now = Sys.time()) {
+  rule <- function(name, default) {
+    x <- config$rules[[name]]
+    if (is.null(x)) default else x
+  }
+  first <- parse_cycle_start(cycle_start)
+  from <- format(first - rule("penalty_window_days", 30))
+  to <- format(first)
 
-set_queue_status <- function(con, person, status) {
-  updated <- DBI::dbExecute(
-    con, "UPDATE queue SET status = ? WHERE person = ? AND status = 'waiting'",
-    params = list(status, person))
-  if (updated == 0) stop(person, " is not waiting in the queue", call. = FALSE)
-  invisible(TRUE)
+  # Dates and times are kept as text, "YYYY-MM-DD ...", which sort as dates.
+  cancelled <- read_changes(con)
+  cancelled <- cancelled[cancelled$kind == "release" & cancelled$at >= from &
+                           cancelled$at < to, ]
+  b <- read_bookings(con)
+  b <- b[b$date >= from & b$date < to, ]
+  closes <- as.POSIXct(paste(b$date, b$start), format = "%Y-%m-%d %H:%M") +
+    rule("checkin_grace_min", 15) * 60
+  missed <- b[b$status == "no_show" | (b$status == "booked" & closes < now), ]
+
+  people <- sort(unique(c(cancelled$person, missed$person)))
+  cancellations <- vapply(people, function(p) sum(cancelled$person == p), 0)
+  no_shows <- vapply(people, function(p) sum(missed$person == p), 0)
+  data.frame(
+    resident_id = as.character(people),
+    cancellations = unname(cancellations),
+    no_shows = unname(no_shows),
+    slots_lost = unname((cancellations > rule("max_cancellations", 3)) +
+                          (no_shows > rule("max_no_shows", 2)))
+  )
 }
 
 last_planned <- function(con, cycle_start) {

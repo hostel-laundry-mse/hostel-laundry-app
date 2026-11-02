@@ -13,8 +13,9 @@
 #            schedule is never returned.
 #
 # Generate reads the answers with read_responses(con). With no answers it
-# refuses ("No responses yet"). The "Use demo data" box instead uses
-# data/fake_survey.csv and data/fake_schedule.csv, checked against
+# refuses ("No responses yet"). People over the cancellation or no-show limit
+# (slot_penalties()) get fewer slots, and the page lists them. The "Use demo
+# data" box instead uses data/fake_survey.csv and data/fake_schedule.csv, checked against
 # load_survey(PATH_SURVEY); a demo schedule can never be published.
 # If the optimiser is missing or fails (status code "error", or no bookings),
 # the failure message is shown and the stand-in fake schedule is displayed,
@@ -37,13 +38,15 @@ text_or <- function(x, default = "") {
 #   last_planned_df - data.frame(resident_id, date) or NULL
 #   demo           - use the fake survey and fake schedule, skip the optimiser
 #   notify         - called with a progress message before each step
+#   slots_lost     - data.frame from slot_penalties(), or NULL
 # Returns list(schedule, source, steps, problems, warnings, message,
 #              cycle_start, cycle_days). source is "optimiser" (publishable),
 # "demo" or "fallback" (stand-in fake schedule, not publishable), or "none".
 # `steps` is a data.frame(step, state, note); state is done, failed, missing
 # or skipped.
 run_pipeline <- function(cycle_start, survey, last_planned_df = NULL,
-                         demo = FALSE, notify = function(msg) NULL) {
+                         demo = FALSE, notify = function(msg) NULL,
+                         slots_lost = NULL) {
   steps <- data.frame(step = character(), state = character(),
                       note = character(), stringsAsFactors = FALSE)
   add <- function(step, state, note = NULL) {
@@ -99,7 +102,8 @@ run_pipeline <- function(cycle_start, survey, last_planned_df = NULL,
     notify("Checking the schedule...")
     p <- tryCatch(
       check_schedule(schedule, check_survey, config, timetable,
-                     if (real) cycle_start, if (real) last_planned_df),
+                     if (real) cycle_start, if (real) last_planned_df,
+                     if (real) slots_lost),
       error = function(e) e)
     if (inherits(p, "error")) {
       add("check_schedule", "failed", conditionMessage(p))
@@ -134,7 +138,7 @@ run_pipeline <- function(cycle_start, survey, last_planned_df = NULL,
   notify("Running the optimiser...")
   res <- tryCatch(
     run_optimiser(survey, free, config, cycle_start, last_planned_df,
-                  verbose = FALSE),
+                  verbose = FALSE, slots_lost = slots_lost),
     error = function(e) e)
   if (inherits(res, "error")) {
     add("run_optimiser", "failed", conditionMessage(res))
@@ -289,6 +293,7 @@ mod_admin_ui <- function(id) {
             div(class = "mb-3",
                 actionButton(ns("publish"), "Publish", disabled = NA)),
             div(class = "mb-3", textOutput(ns("published_state")))),
+        div(class = "form-text mb-2", "Generating a schedule takes about 3 minutes."),
         checkboxInput(ns("use_demo"),
                       "Use demo data (fake survey and fake schedule, cannot be published)",
                       value = FALSE),
@@ -298,7 +303,7 @@ mod_admin_ui <- function(id) {
       navset_card_tab(
         title = "Activity",
         tab("Queue", "queue"),
-        tab("Changes", "changes"),
+        tab("Cancellations", "changes"),
         tab("No-shows", "noshows")
       )
     )
@@ -321,6 +326,8 @@ mod_admin_server <- function(id, con = NULL) {
       demo <- isTRUE(input$use_demo)
       survey <- NULL
       last_planned_df <- NULL
+      penalties <- NULL
+      penalty_error <- NULL
       if (!demo) {
         survey <- tryCatch(read_responses(con), error = function(e) NULL)
         if (is.null(survey) || nrow(survey) == 0) {
@@ -334,12 +341,22 @@ mod_admin_server <- function(id, con = NULL) {
         }
         last_planned_df <- tryCatch(last_planned(con, input$cycle_start),
                                     error = function(e) NULL)
+        penalties <- tryCatch(
+          slot_penalties(con, input$cycle_start, load_config(PATH_CONFIG)),
+          error = function(e) {
+            penalty_error <<- conditionMessage(e)
+            NULL
+          })
+      }
+      penalised <- if (is.data.frame(penalties)) {
+        penalties[penalties$slots_lost > 0, , drop = FALSE]
       }
 
       res <- withProgress(
         message = "Generating schedule...", value = 0.1,
         run_pipeline(input$cycle_start, survey, last_planned_df, demo,
-                     notify = function(msg) setProgress(message = msg)))
+                     notify = function(msg) setProgress(message = msg),
+                     slots_lost = penalised))
       schedule(res$schedule)
       generated(if (is.null(res$schedule)) NULL else
         list(cycle_start = as.Date(input$cycle_start),
@@ -365,6 +382,18 @@ mod_admin_server <- function(id, con = NULL) {
                            res$message, " Showing the stand-in fake schedule; ",
                            "this cannot be published."),
           alert("alert-danger", res$message)),
+        if (!is.null(penalty_error)) {
+          alert("alert-danger", strong("Penalties could not be worked out, so nobody lost a slot: "),
+                penalty_error)
+        },
+        if (has_rows(penalised)) {
+          alert("alert-warning", strong("Slots lost this cycle:"),
+                tags$ul(lapply(seq_len(nrow(penalised)), function(i) {
+                  tags$li(sprintf("%s loses %d (%d cancellations, %d no-shows)",
+                                  penalised$resident_id[i], penalised$slots_lost[i],
+                                  penalised$cancellations[i], penalised$no_shows[i]))
+                })))
+        },
         if (length(res$warnings)) {
           alert("alert-warning", strong("Warnings while building free windows:"),
                 tags$ul(lapply(res$warnings, tags$li)))
@@ -425,8 +454,8 @@ mod_admin_server <- function(id, con = NULL) {
           paste0("This cycle (", format(g$cycle_start), " to ",
                  format(g$cycle_start + g$cycle_days - 1), ") already has ",
                  nrow(existing), " booking(s). Publishing replaces them with ",
-                 "the new plan. If any were changed, checked in or added from ",
-                 "the queue, the replacement is refused."),
+                 "the new plan. If any were cancelled, checked in or claimed ",
+                 "as free slots, the replacement is refused."),
           footer = tagList(modalButton("Cancel"),
                            actionButton(session$ns("confirm_publish"),
                                         "Replace plan", class = "btn-danger"))))

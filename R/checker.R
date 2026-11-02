@@ -1,7 +1,7 @@
 # Schedule checker: validates a schedule against the rules in CLAUDE.md.
 #
 # check_schedule(schedule, survey, config, timetable = load_timetable(),
-#                cycle_start = NULL, last_planned = NULL)
+#                cycle_start = NULL, last_planned = NULL, slots_lost = NULL)
 #   Takes: schedule     - data.frame (person, machine, date, start, end)
 #          survey       - data.frame from load_survey()
 #          config       - list from load_config()
@@ -13,6 +13,9 @@
 #                         day 1, so pass it whenever it is known.
 #          last_planned - optional data.frame(resident_id, date) from
 #                         last_planned(). NULL skips the cross-cycle rules.
+#          slots_lost   - optional data.frame(resident_id, slots_lost) from
+#                         slot_penalties(): those people are expected to have
+#                         that many fewer bookings.
 #   Returns: data.frame of problems, one row per problem, ordered by row, with
 #            columns rule, person, machine, date, row, message. Zero rows means
 #            the schedule is valid. row is the schedule row number; for a rule
@@ -28,7 +31,8 @@
 #            10-hour blocked limit.
 
 check_schedule <- function(schedule, survey, config, timetable = load_timetable(),
-                           cycle_start = NULL, last_planned = NULL) {
+                           cycle_start = NULL, last_planned = NULL,
+                           slots_lost = NULL) {
   require_columns(schedule, c("person", "machine", "date", "start", "end"),
                   "check_schedule()")
   rule <- function(name, default) {
@@ -198,9 +202,13 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
   # Each person's bookings together.
   for (person in survey$resident_id) {
     n_booked <- sum(bookings$person == person)
-    if (n_booked != slots) {
+    lost <- if (is.null(slots_lost)) 0 else {
+      sum(slots_lost$slots_lost[slots_lost$resident_id == person])
+    }
+    allowed <- max(slots - lost, 0)
+    if (n_booked != allowed) {
       add_person("slot_count", person, paste0(person, " has ", n_booked,
-                                              " booking(s), not ", slots))
+                                              " booking(s), not ", allowed))
     }
 
     own <- usable[usable$person == person, ]
@@ -236,7 +244,9 @@ check_schedule <- function(schedule, survey, config, timetable = load_timetable(
                           " day(s) after the last cycle's ", format(previous))
         if (gap < gap_min) {
           add("cross_too_soon", own[1, ], paste0(between, ", under ", gap_min))
-        } else if (gap > gap_max) {
+        } else if (gap > gap_max && previous + gap_max >= first_day) {
+          # Skipped when the 4-5 day window ended before this cycle began, as
+          # after a penalty: no date in this cycle could meet it.
           add("cross_too_late", own[1, ], paste0(between, ", over ", gap_max))
         }
       }

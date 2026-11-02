@@ -8,10 +8,10 @@
 #
 # Things to try:
 #   - R001 at Tue 03 Nov 10:05: "Started" is open for the 10:00 slot.
-#   - R001's Sat 07 Nov slot: "Can't make it" -> move it or release it.
-#   - Within 6 hours of a slot only "Release it" is offered.
-#   - Release a slot, then sign in as someone else in that block and look at
-#     Schedule -> Free now (or join the queue first and get it automatically).
+#   - R001's Sat 07 Nov slot: "Can't make it" -> cancel it.
+#   - Within 6 hours of a slot it can't be cancelled.
+#   - Cancel a slot, then sign in as someone else in that block and look at
+#     Schedule -> Free now.
 
 if (!file.exists("dev/load_app_code.R")) setwd("..")   # runApp() starts in dev/
 source("dev/load_app_code.R")
@@ -22,7 +22,7 @@ people <- sort(unique(sched$person))
 days <- format(as.Date("2026-11-02") + 0:9)
 
 seed <- function(con, now) {
-  for (t in c("changes", "queue", "bookings")) DBI::dbExecute(con, paste("DELETE FROM", t))
+  for (t in c("changes", "bookings")) DBI::dbExecute(con, paste("DELETE FROM", t))
   add_bookings(con, sched)          # what Publish on the Admin page does
   b <- read_bookings(con)
   used <- b$booking_id[res_dt(b$date, b$end) < now]

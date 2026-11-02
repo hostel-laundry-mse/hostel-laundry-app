@@ -17,9 +17,10 @@ rules,gap_max_days,5
 rules,second_slot_min_day,6
 rules,lecture_margin_min,30
 rules,max_blocked_hours,10
-rules,change_cutoff_hours,6
-rules,max_changes,3
-rules,changes_window_days,30
+rules,cancel_cutoff_hours,6
+rules,max_cancellations,3
+rules,max_no_shows,2
+rules,penalty_window_days,30
 rules,checkin_grace_min,15
 rules,reserve_share,0.1
 rules,peak_target,120
