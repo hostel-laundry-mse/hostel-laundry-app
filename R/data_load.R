@@ -16,7 +16,8 @@
 #                 out_of_order = character vector of machine ids,
 #                 bands        = data.frame(band, from, to)).
 #            hours$days is a character vector and times are "HH:MM".
-#            hours$buffer_min is left out if the file does not set it.
+#            hours$buffer_min is left out if the file does not set it, and so
+#            are the optional normal_start, normal_end, odd_start and odd_end.
 #
 # load_timetable(path)
 #   Takes: path to a timetable CSV (see CLAUDE.md "Timetable format").
@@ -33,6 +34,16 @@
 #            Sorted by resident and time. A person or date with no free time
 #            has no rows. Warns about a course with no lectures in the
 #            timetable, since its residents count as free at all those times.
+#            Lectures are widened by lecture_margin_min and blocked times by
+#            blocked_buffer_before_min and blocked_buffer_after_min, so a wash
+#            that fits a window is clear of them all.
+#
+# widen_blocked(blocked, config)
+#   Takes: blocked - data.frame(day, start, end) from parse_blocked()
+#          config  - list from load_config()
+#   Returns: the same columns, each row widened by the blocked buffers (default
+#            30 minutes each). A buffer crossing midnight continues on the
+#            neighbouring weekday.
 #
 # db_connect(path)
 #   Takes: path to an SQLite file, created if it does not exist.
@@ -50,7 +61,9 @@
 # load_participants(path)
 #   Takes: path to a CSV with columns resident_id, name, email, block.
 #   Returns: data.frame with those columns, emails in lower case. Stops unless
-#            every email ends in @mse.ac.in and IDs and emails are unique.
+#            every email ends in @mse.ac.in and IDs and emails are unique, and
+#            no ID matches SIMULATED_ID_PATTERN (S + digits, any case), which
+#            is kept for simulated residents.
 # write_residents(con, df)
 #   Replaces the whole login list with df, checked as above: anyone left out
 #   can no longer log in. Their consents, bookings and feedback are kept.
@@ -153,6 +166,8 @@
 
 WEEKDAYS <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
+SIMULATED_ID_PATTERN <- "^[Ss][0-9]+$"
+
 load_survey <- function(path = "data/fake_survey.csv") {
   survey <- read_data_csv(path, c("resident_id", "name", "block", "program",
                                   "course", "blocked"))
@@ -225,6 +240,11 @@ load_config <- function(path = "data/config.csv") {
     hours$buffer_min <- as_numbers(
       data.frame(key = "buffer_min", value = h$buffer_min), "hours")
   }
+  for (key in intersect(c("normal_start", "normal_end", "odd_start", "odd_end"),
+                        names(h))) {
+    parse_hhmm(h[[key]], paste0(path, ": hours,", key))
+    hours[[key]] <- h[[key]]
+  }
 
   list(
     machines = data.frame(block = machines$key,
@@ -289,7 +309,8 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
   )
 
   windows <- lapply(seq_len(nrow(survey)), function(i) {
-    blocked <- parse_blocked(survey$blocked[i], survey$resident_id[i])
+    blocked <- widen_blocked(parse_blocked(survey$blocked[i], survey$resident_id[i]),
+                             config)
     own <- lectures[lectures$course == survey$course[i], ]
     busy <- rbind(own[, c("day", "start", "end")], blocked)
 
@@ -311,6 +332,25 @@ build_free_windows <- function(survey, timetable, config, cycle_start) {
   ))
   rownames(out) <- NULL
   out
+}
+
+widen_blocked <- function(blocked, config) {
+  buffer <- function(name) {
+    x <- config$rules[[name]]
+    if (is.null(x)) 30 else x
+  }
+  before <- buffer("blocked_buffer_before_min")
+  after <- buffer("blocked_buffer_after_min")
+  neighbour <- function(day, by) WEEKDAYS[(match(day, WEEKDAYS) - 1 + by) %% 7 + 1]
+  early <- blocked[blocked$start - before < 0, , drop = FALSE]
+  late <- blocked[blocked$end + after > 1440, , drop = FALSE]
+  data.frame(
+    day = c(blocked$day, neighbour(early$day, -1), neighbour(late$day, 1)),
+    start = c(pmax(blocked$start - before, 0), early$start - before + 1440,
+              rep(0, nrow(late))),
+    end = c(pmin(blocked$end + after, 1440), rep(1440, nrow(early)),
+            late$end + after - 1440)
+  )
 }
 
 db_connect <- function(path = "data/laundry.sqlite") {
@@ -431,6 +471,10 @@ load_participants <- function(path = "data/participants.csv") {
   check_residents(participants[, cols], path)
 }
 
+is_simulated_id <- function(id) {
+  grepl(SIMULATED_ID_PATTERN, id)
+}
+
 # Trims and lower-cases, then stops on anything not fit to be a login list.
 check_residents <- function(df, where) {
   cols <- c("resident_id", "name", "email", "block")
@@ -441,6 +485,12 @@ check_residents <- function(df, where) {
   if (nrow(df) == 0) stop(where, ": no residents", call. = FALSE)
   df[!is.na(df) & df == ""] <- NA_character_
   require_values(df, cols, where)
+
+  reserved <- df$resident_id[is_simulated_id(df$resident_id)]
+  if (length(reserved) > 0) {
+    stop(where, ": resident_id looking like S01 is kept for simulated residents: ",
+         paste(reserved, collapse = ", "), call. = FALSE)
+  }
 
   bad <- which(!grepl("^[^@[:space:]]+@mse\\.ac\\.in$", df$email))
   if (length(bad) > 0) {
@@ -709,6 +759,13 @@ import_responses <- function(con, paths, prefer = NULL) {
         "\nChoose who wins with prefer = \"<path>\" or prefer = \"database\"."),
         call = NULL, conflicts = conflicts)
     ))
+  }
+
+  reserved <- unique(c(responses$rows$resident_id, residents$rows$resident_id))
+  reserved <- reserved[is_simulated_id(reserved)]
+  if (length(reserved) > 0) {
+    stop("Nothing imported: resident_id looking like S01 is kept for simulated ",
+         "residents: ", paste(reserved, collapse = ", "), call. = FALSE)
   }
 
   merged <- residents$rows

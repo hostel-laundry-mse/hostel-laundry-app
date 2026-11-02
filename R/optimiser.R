@@ -29,7 +29,10 @@
 #     diagnostics = list(candidates, variables, constraints, build_s,
 #                   solve_s, objective, utilisation, gap_relaxed, penalised,
 #                   per_block), penalised is data.frame(resident_id, slots_cap)
-#                   of everyone with a reduced allowance.
+#                   of everyone with a reduced allowance. status$per_block has
+#                   a stage column, "real" or "simulated", and a block with
+#                   simulated residents has one row for each. The status message
+#                   counts how many underserved people are simulated.
 #
 # optimise_schedule(survey, free_windows, config, cycle_start, last_planned)
 #   Same inputs. Returns only the schedule data.frame.
@@ -47,12 +50,17 @@
 #   Machines in a block are identical, so specific machines are given out
 #   afterwards by assign_machines(), which always succeeds when that limit
 #   holds. Hostel blocks share no machines, so each block is its own model.
+#   Two stages: in each block the real residents are solved alone, exactly as if
+#   nobody simulated (is_simulated_id()) existed. The simulated residents are
+#   then solved around those bookings, which never move, so they may end up
+#   underserved. That is reported, not an error.
 #
 # The config list from load_config() is read with these names (all but
 # machines, programs and hours$open/close/days are optional):
 #   machines     data.frame(block, n_machines)
 #   programs     data.frame(program, duration_min)
-#   hours        list(open, close, days, buffer_min)
+#   hours        list(open, close, days, buffer_min, normal_start, normal_end,
+#                odd_start, odd_end)
 #   rules        named list of the rules,* rows in config.csv
 #   out_of_order character vector of machine ids, e.g. "C-2"
 
@@ -65,17 +73,20 @@ library(ROI.plugin.glpk)
 # penalties. The gap constraints in build_model() are written for at most 2.
 SLOTS_PER_CYCLE <- 2L
 
-# Preference points for a wash inside the preferred hours. A preferred weekday
-# is worth 1, so the time of day counts for more than the day.
-PREFERRED_HOURS_POINTS <- 2L
+# Preference points for a wash inside normal hours. A preferred weekday is worth
+# 1, so the time of day counts for more than the day.
+NORMAL_HOURS_POINTS <- 2L
 
 # Objective weights.
-#   pref:   value of one preference point (scores are 1 to 4).
+#   pref:   value of one preference point (scores are 1 to 4, less the odd-hours
+#           penalty).
 #   peak:   cost of one booked machine-minute above peak_target in an hour.
 #   assign: value of one booking. NULL means "set automatically" to
-#           3 * pref * A_max + peak * A_max * longest booking minutes + 1,
-#           where A_max is the most bookings the block could get. Swapping
-#           bookings around can raise total preference by at most 3 per
+#           spread * pref * A_max + peak * A_max * longest booking minutes + 1,
+#           where A_max is the most bookings the stage could get and spread is
+#           the highest score less the lowest, counting 0 as a score because a
+#           booking with a negative score must still beat no booking. Swapping
+#           bookings around can raise total preference by at most spread per
 #           booking and lower total overload by at most the booked minutes,
 #           so with this value one extra booking always beats any preference
 #           or peak gain: nobody loses a booking to improve someone else's
@@ -123,24 +134,34 @@ run_optimiser_unsafe <- function(survey, free_windows, config, cycle_start,
   people <- mark_gap_relaxed(people, candidates, cfg)
 
   # Solve each hostel block separately: blocks share no machines.
-  booked <- list()
+  booked_real <- list()
+  booked_sim <- list()
   per_block <- list()
   for (b in cfg$machines$block) {
     cand_b <- filter(candidates, block == b)
     people_b <- filter(people, block == b, valid)
-    res <- solve_block(cand_b, people_b, cfg, grid, weights, time_limit)
-    booked[[b]] <- res$booked
-    per_block[[b]] <- data.frame(block = b, res$info)
+    sim_cand <- is_simulated_id(cand_b$resident_id)
+    sim_people <- is_simulated_id(people_b$resident_id)
+    real <- solve_block(cand_b[!sim_cand, ], people_b[!sim_people, ], cfg, grid,
+                        weights, time_limit)
+    booked_real[[b]] <- real$booked
+    per_block[[length(per_block) + 1]] <- data.frame(block = b, stage = "real", real$info)
+    if (any(sim_people)) {
+      sim <- solve_block(cand_b[sim_cand, ], people_b[sim_people, ], cfg, grid,
+                         weights, time_limit, fixed = real$booked)
+      booked_sim[[b]] <- sim$booked
+      per_block[[length(per_block) + 1]] <- data.frame(block = b, stage = "simulated", sim$info)
+    }
   }
-  booked <- bind_rows(booked)
   per_block <- bind_rows(per_block)
-  if (nrow(booked) == 0) booked <- candidates[0, ]
+  booked <- bind_rows(candidates[0, ], unname(booked_real))
   booked <- assign_machines(booked, grid)
+  booked <- assign_around(bind_rows(candidates[0, ], unname(booked_sim)), booked, grid)
 
   schedule <- extract_schedule(rep(1, nrow(booked)), booked)
   underserved <- find_underserved(booked, candidates, people, cfg)
 
-  not_optimal <- per_block$block[!per_block$status %in% c("optimal", "no candidates")]
+  not_optimal <- unique(per_block$block[!per_block$status %in% c("optimal", "no candidates")])
   code <- if (length(not_optimal) == 0) "optimal" else "not proven optimal"
   message <- paste0(
     if (code == "optimal") "Optimal schedule found: " else
@@ -148,7 +169,8 @@ run_optimiser_unsafe <- function(survey, free_windows, config, cycle_start,
              " were not solved to optimality (see per_block). "),
     nrow(schedule), " bookings for ", n_distinct(schedule$person), " of ",
     nrow(people), " people; ", nrow(underserved),
-    " people got fewer than their allowance; ",
+    " people got fewer than their allowance (",
+    sum(is_simulated_id(underserved$person)), " simulated); ",
     sum(people$cap < SLOTS_PER_CYCLE), " penalised."
   )
 
@@ -192,7 +214,9 @@ normalise_config <- function(config) {
       programs = data.frame(program = p$key, duration_min = as.numeric(p$value)),
       hours = list(open = h$open, close = h$close,
                    days = strsplit(h$days, ";")[[1]],
-                   buffer_min = h$buffer_min),
+                   buffer_min = h$buffer_min, normal_start = h$normal_start,
+                   normal_end = h$normal_end, odd_start = h$odd_start,
+                   odd_end = h$odd_end),
       rules = setNames(as.list(r$value), r$key),
       out_of_order = get("out_of_order")$key
     )
@@ -202,6 +226,7 @@ normalise_config <- function(config) {
     if (is.null(x) || length(x) == 0 || is.na(x[[1]]) || x[[1]] == "") default
     else as.numeric(x[[1]])
   }
+  hm_or <- function(x, default) hm_to_min(if (is.null(x)) default else x)
   rules <- config$rules
   days <- config$hours$days
   if (length(days) == 1) days <- strsplit(days, ";")[[1]]
@@ -220,9 +245,12 @@ normalise_config <- function(config) {
     gap_max = opt(rules$gap_max_days, 5),
     reserve_share = opt(rules$reserve_share, 0),
     peak_target = opt(rules$peak_target, NA),
-    blocked_margin = opt(rules$blocked_margin_min, 30),
-    preferred_from = opt(rules$preferred_from_min, 14 * 60),
-    preferred_to = opt(rules$preferred_to_min, 23 * 60),
+    normal_start = hm_or(config$hours$normal_start, "14:00"),
+    normal_end = hm_or(config$hours$normal_end, "23:00"),
+    odd_start = hm_or(config$hours$odd_start, "00:00"),
+    odd_end = hm_or(config$hours$odd_end, "07:00"),
+    odd_penalty_real = opt(rules$odd_penalty_real, 8),
+    odd_penalty_simulated = opt(rules$odd_penalty_simulated, 2),
     out_of_order = as.character(config$out_of_order)
   )
 }
@@ -233,7 +261,6 @@ normalise_config <- function(config) {
 # block or program is not in config are marked not valid.
 prepare_people <- function(survey, cfg, grid, last_planned = NULL, slots_lost = NULL) {
   if (!"pref_days" %in% names(survey)) survey$pref_days <- NA_character_
-  if (!"blocked" %in% names(survey)) survey$blocked <- NA_character_
   lost <- data.frame(resident_id = character(), lost = numeric())
   if (!is.null(slots_lost) && nrow(slots_lost) > 0) {
     lost <- transmute(slots_lost, resident_id = as.character(resident_id),
@@ -328,15 +355,14 @@ generate_grid <- function(cfg, cycle_start) {
 #   - the date is an open date of the cycle and the whole booking, buffer
 #     included, fits inside opening hours,
 #   - the wash itself (start to start + program duration) fits inside one of
-#     the person's free windows, which already exclude lectures (with their
-#     margin) and blocked times. The buffer is machine time, not the
-#     person's, so it may run past the end of the window,
-#   - the wash stays blocked_margin minutes clear of the person's blocked times:
-#     nobody washes just before going to sleep or just after waking up,
+#     the person's free windows, which already exclude lectures and blocked
+#     times, each with its buffers. The buffer after a wash is machine time,
+#     not the person's, so it may run past the end of the window,
 #   - it is at least gap_min days after the person's last planned booking of
 #     the previous cycle.
-# Preference score: 1, plus 1 on a preferred weekday, plus
-# PREFERRED_HOURS_POINTS if the whole wash is inside the preferred hours.
+# Preference score: 1, plus 1 on a preferred weekday, plus NORMAL_HOURS_POINTS if
+# the whole wash is inside normal hours, less the odd-hours penalty (real or
+# simulated) if any of the wash overlaps odd hours.
 build_candidates <- function(people, free_windows, cfg, grid) {
   ok <- filter(people, valid, cap > 0, grid$working[block] > 0)
   windows <- free_windows |>
@@ -365,56 +391,24 @@ build_candidates <- function(people, free_windows, cfg, grid) {
     ) |>
     distinct()
 
-  candidates <- ok |>
+  ok |>
     select(resident_id, block, duration_min, cells, pref_days) |>
     inner_join(starts, by = "resident_id") |>
     left_join(grid$dates, by = "date") |>
     mutate(
       start_min = grid$cell_start(s),
-      end_min = start_min + duration_min
-    )
-
-  too_close <- candidates |>
-    inner_join(blocked_with_margin(ok, cfg), by = c("resident_id", "weekday"),
-               relationship = "many-to-many") |>
-    filter(start_min < to, from < end_min) |>
-    distinct(resident_id, date, s)
-
-  candidates |>
-    anti_join(too_close, by = c("resident_id", "date", "s")) |>
-    mutate(
-      in_hours = start_min >= cfg$preferred_from & end_min <= cfg$preferred_to,
-      score = 1L + in_day_list(weekday, pref_days) + PREFERRED_HOURS_POINTS * in_hours
+      end_min = start_min + duration_min,
+      normal = start_min >= cfg$normal_start & end_min <= cfg$normal_end,
+      odd = start_min < cfg$odd_end & cfg$odd_start < end_min,
+      odd_penalty = ifelse(is_simulated_id(resident_id),
+                           cfg$odd_penalty_simulated, cfg$odd_penalty_real),
+      score = 1L + in_day_list(weekday, pref_days) + NORMAL_HOURS_POINTS * normal -
+        odd_penalty * odd
     ) |>
     arrange(block, resident_id, day_idx, s) |>
     mutate(id = row_number()) |>
     select(id, resident_id, block, date, day_idx, s, cells, start_min,
            end_min, score)
-}
-
-# Each person's blocked times widened by blocked_margin on both sides, as
-# data.frame(resident_id, weekday, from, to) in minutes after midnight of that
-# weekday. A margin crossing midnight also covers the neighbouring weekday.
-blocked_with_margin <- function(people, cfg) {
-  m <- cfg$blocked_margin
-  neighbour <- function(day, by) WEEKDAYS[(match(day, WEEKDAYS) - 1 + by) %% 7 + 1]
-  rows <- lapply(seq_len(nrow(people)), function(i) {
-    b <- parse_blocked(people$blocked[i], people$resident_id[i])
-    if (nrow(b) == 0) return(NULL)
-    before <- b[b$start - m < 0, , drop = FALSE]
-    after <- b[b$end + m > 1440, , drop = FALSE]
-    data.frame(
-      resident_id = people$resident_id[i],
-      weekday = c(b$day, neighbour(before$day, -1), neighbour(after$day, 1)),
-      from = c(b$start - m, before$start - m + 1440, rep(0, nrow(after))),
-      to = c(b$end + m, rep(1440, nrow(before)), after$end + m - 1440)
-    )
-  })
-  bind_rows(
-    data.frame(resident_id = character(), weekday = character(),
-               from = numeric(), to = numeric()),
-    rows
-  )
 }
 
 # A person with a previous-cycle booking must have their first booking
@@ -462,6 +456,15 @@ in_day_list <- function(weekday, lists) {
   }, logical(1))
 }
 
+# Machines busy per date and block of time, from bookings already fixed.
+fixed_load <- function(fixed, grid) {
+  if (is.null(fixed) || nrow(fixed) == 0) {
+    return(data.frame(date = as.Date(character()), cell = numeric(),
+                      hour = numeric(), busy = integer()))
+  }
+  count(occupied_cells(fixed, grid), date, cell, hour, name = "busy")
+}
+
 # Expands each booking or candidate to the blocks it occupies (buffer
 # included).
 occupied_cells <- function(cand, grid) {
@@ -482,14 +485,17 @@ occupied_cells <- function(cand, grid) {
 # Builds the ompr model for one hostel block. Constraint rows are first
 # built as sparse lists (candidate positions and coefficients per row), then
 # added in one quantified add_constraint call. relax = TRUE makes x
-# continuous in [0, 1], used only to get an upper bound for the gap.
-build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
+# continuous in [0, 1], used only to get an upper bound for the gap. fixed holds
+# bookings that are already made in this block: they take up machines, reserve
+# and peak room but are not decided here.
+build_model <- function(cand, people, cfg, grid, weights, relax = FALSE, fixed = NULL) {
   n <- nrow(cand)
   cand$k <- seq_len(n)
   g <- cfg$grid_min
   n_working <- unname(grid$working[cand$block[1]])
   occ <- occupied_cells(cand, grid) |>
     left_join(select(cand, id, k), by = "id")
+  load <- fixed_load(fixed, grid)
 
   rows <- list(ids = list(), coef = list(), rhs = numeric())
   add_row <- function(rows, ids, coef, rhs) {
@@ -502,17 +508,21 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
   # MACHINE CAPACITY: at any moment, the number of bookings running in this
   # block (each counted from its start until the end of its buffer) is at
   # most the number of working machines in the block. Bookings are time
-  # intervals, so checking the blocks where some booking starts is enough.
-  # Rows that cannot be exceeded are skipped.
-  starts <- distinct(cand, date, cell = s)
+  # intervals, so checking the blocks where some booking starts is enough, and
+  # a fixed booking counts as starting in every block it holds. Rows that cannot
+  # be exceeded are skipped.
+  starts <- distinct(bind_rows(distinct(cand, date, cell = s), select(load, date, cell)))
   capacity <- occ |>
     semi_join(starts, by = c("date", "cell")) |>
     group_by(date, cell) |>
     summarise(ids = list(sort(k)), .groups = "drop") |>
-    filter(lengths(ids) > n_working)
+    left_join(select(load, date, cell, busy), by = c("date", "cell")) |>
+    mutate(room = n_working - coalesce(busy, 0L)) |>
+    filter(lengths(ids) > room) |>
+    arrange(room)
   capacity <- capacity[!duplicated(vapply(capacity$ids, paste, "", collapse = ",")), ]
   for (i in seq_len(nrow(capacity))) {
-    rows <- add_row(rows, capacity$ids[[i]], rep(1, length(capacity$ids[[i]])), n_working)
+    rows <- add_row(rows, capacity$ids[[i]], rep(1, length(capacity$ids[[i]])), capacity$room[i])
   }
 
   # Per-person rules. y_d below means "number of this person's bookings on
@@ -571,9 +581,11 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
   reserve <- cand |>
     group_by(date) |>
     summarise(ids = list(k), coef = list(cells * g), .groups = "drop") |>
-    filter(vapply(coef, sum, 0) > reserve_cap)
+    left_join(summarise(group_by(load, date), minutes = sum(busy) * g), by = "date") |>
+    mutate(room = reserve_cap - coalesce(minutes, 0)) |>
+    filter(vapply(coef, sum, 0) > room)
   for (i in seq_len(nrow(reserve))) {
-    rows <- add_row(rows, reserve$ids[[i]], reserve$coef[[i]], reserve_cap)
+    rows <- add_row(rows, reserve$ids[[i]], reserve$coef[[i]], reserve$room[i])
   }
 
   # PEAK OVERLOAD: for each clock hour of each date, booked machine-minutes
@@ -586,14 +598,17 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
       summarise(minutes = n() * g, .groups = "drop") |>
       group_by(date, hour) |>
       summarise(ids = list(k), coef = list(minutes), .groups = "drop") |>
-      filter(vapply(coef, sum, 0) > cfg$peak_target)
+      left_join(summarise(group_by(load, date, hour), fixed_min = sum(busy) * g,
+                          .groups = "drop"), by = c("date", "hour")) |>
+      mutate(room = cfg$peak_target - coalesce(fixed_min, 0)) |>
+      filter(vapply(coef, sum, 0) > room)
   }
   n_peak <- nrow(peak)
 
   # Objective weights; see default_weights().
   a_max <- sum(people$cap)
   assign_w <- weights$assign
-  auto_w <- 3 * weights$pref * a_max +
+  auto_w <- (max(cand$score, 0) - min(cand$score, 0)) * weights$pref * a_max +
     weights$peak * a_max * max(cand$cells) * g + 1
   if (is.null(assign_w)) {
     assign_w <- auto_w
@@ -630,11 +645,11 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
   if (n_peak > 0) {
     pk_ids <- peak$ids
     pk_coef <- peak$coef
-    target <- cfg$peak_target
+    target <- peak$room
     model <- add_constraint(
       model,
       sum_over(pk_coef[[r]][j] * x[pk_ids[[r]][j]], j = seq_along(pk_ids[[r]])) -
-        o[r] <= target,
+        o[r] <= target[r],
       r = seq_len(n_peak)
     )
   }
@@ -655,8 +670,16 @@ build_model <- function(cand, people, cfg, grid, weights, relax = FALSE) {
 #   "error: ..." / "solver status"    same greedy fallback
 # gap = (upper bound - objective) / upper bound, where the upper bound comes
 # from solving the model with x relaxed to [0, 1]. GLPK through ROI cannot
-# report its own bound or take a gap tolerance.
-solve_block <- function(cand, people, cfg, grid, weights, time_limit) {
+# report its own bound or take a gap tolerance. fixed holds bookings already
+# made in this block, see build_model(); candidates they leave no machine for are
+# dropped first.
+solve_block <- function(cand, people, cfg, grid, weights, time_limit, fixed = NULL) {
+  load <- fixed_load(fixed, grid)
+  if (nrow(load) > 0 && nrow(cand) > 0) {
+    full <- filter(load, busy >= grid$working[[cand$block[1]]])
+    cand <- anti_join(cand, semi_join(occupied_cells(cand, grid), full,
+                                      by = c("date", "cell")), by = "id")
+  }
   info <- data.frame(
     status = "no candidates", candidates = nrow(cand), variables = 0,
     constraints = 0, build_s = 0, solve_s = 0, objective = NA_real_,
@@ -666,12 +689,14 @@ solve_block <- function(cand, people, cfg, grid, weights, time_limit) {
 
   fallback <- function(info, why) {
     info$status <- why
-    list(booked = greedy_fill(cand[0, ], cand, people, cfg, grid), info = info)
+    around <- if (is.null(fixed)) cand[0, ] else fixed
+    filled <- greedy_fill(around, cand, people, cfg, grid)
+    list(booked = filter(filled, resident_id %in% people$resident_id), info = info)
   }
 
   tryCatch({
     t0 <- Sys.time()
-    built <- build_model(cand, people, cfg, grid, weights)
+    built <- build_model(cand, people, cfg, grid, weights, fixed = fixed)
     t1 <- Sys.time()
     sol <- solve_model(built$model, with_ROI(
       solver = "glpk", control = list(tm_limit = time_limit * 1000)
@@ -692,7 +717,7 @@ solve_block <- function(cand, people, cfg, grid, weights, time_limit) {
         info$gap <- 0
       } else {
         info$status <- "time limit, not proven optimal"
-        info$gap <- relaxed_gap(cand, people, cfg, grid, weights, info$objective)
+        info$gap <- relaxed_gap(cand, people, cfg, grid, weights, info$objective, fixed)
       }
       list(booked = cand[xs$value > 0.5, ], info = info)
     } else {
@@ -706,9 +731,9 @@ solve_block <- function(cand, people, cfg, grid, weights, time_limit) {
 }
 
 # Relative gap between an objective value and the relaxed (LP) optimum.
-relaxed_gap <- function(cand, people, cfg, grid, weights, objective) {
+relaxed_gap <- function(cand, people, cfg, grid, weights, objective, fixed = NULL) {
   tryCatch({
-    lp <- build_model(cand, people, cfg, grid, weights, relax = TRUE)
+    lp <- build_model(cand, people, cfg, grid, weights, relax = TRUE, fixed = fixed)
     bound <- objective_value(solve_model(lp$model, with_ROI("glpk")))
     (bound - objective) / abs(bound)
   }, error = function(e) NA_real_)
@@ -800,6 +825,32 @@ assign_machines <- function(booked, grid) {
     }
   }
   booked
+}
+
+# Gives the simulated residents' bookings a working machine around bookings
+# already placed, which keep theirs. Each goes to the lowest-numbered machine
+# with no overlap. With two or more machines the placed bookings can leave no
+# single machine free even though the model's count of busy machines held; such
+# a booking is dropped, so the person shows up as underserved.
+assign_around <- function(booked, placed, grid) {
+  if (nrow(booked) == 0) return(placed)
+  working <- filter(grid$machines, in_order)
+  booked <- arrange(booked, block, day_idx, s, resident_id)
+  booked$machine <- NA_character_
+  booked$machine_no <- NA_integer_
+  for (i in seq_len(nrow(booked))) {
+    ms <- filter(working, block == booked$block[i])
+    for (j in seq_len(nrow(ms))) {
+      same <- placed[placed$machine == ms$machine[j] & placed$date == booked$date[i], ]
+      if (all(same$s + same$cells <= booked$s[i] | same$s >= booked$s[i] + booked$cells[i])) {
+        booked$machine[i] <- ms$machine[j]
+        booked$machine_no[i] <- ms$machine_no[j]
+        placed <- bind_rows(placed, booked[i, ])
+        break
+      }
+    }
+  }
+  bind_rows(placed, booked[0, ])
 }
 
 # Turns a 0/1 solution vector (one value per row of candidates, which must
