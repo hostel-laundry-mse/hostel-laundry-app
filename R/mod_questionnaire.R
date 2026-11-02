@@ -42,7 +42,7 @@ SURVEY_COLUMNS <- c("resident_id", "name", "block", "program",
 EMAIL_DOMAIN <- "mse.ac.in"
 
 # Change this when the terms change: everyone then has to agree again.
-TERMS_VERSION <- "2026-10-31-v1"
+TERMS_VERSION <- "2026-11-02-v1"
 
 CONSENT_LABEL <- "I have read and agree to the Terms of Use and the data policy."
 
@@ -50,7 +50,7 @@ CONSENT_LABEL <- "I have read and agree to the Terms of Use and the data policy.
 # either bullets or a numbered list.
 TERMS <- list(
   list(title = "1. How slots are allocated", bullets = c(
-    "The app tries to match your preferred days and times, but they are not guaranteed. The schedule is built from everyone's timetables, availability and preferences, so some requests can't be met.",
+    "The app tries to match your preferred days, but they are not guaranteed. It avoids your blocked times and sleep hours. The schedule is built from everyone's timetables, availability and preferences, so some requests can't be met.",
     "Each resident gets up to 2 slots per 10-day cycle, with a gap of 4–5 days between them. A quick wash is 30 minutes and a normal wash is 60 minutes.",
     "Access is by block: Block D for boys, Blocks A–C for girls.",
     "A small share of slots is kept free for walk-ins. Extra slots are given only after everyone's two slots have been used.")),
@@ -59,25 +59,13 @@ TERMS <- list(
     "Check in within 15 minutes of your slot's start. After that, the slot is released to others.",
     "Use only your own slots. Don't swap or sell them.")),
   list(title = "3. Cancelling or changing a slot", bullets = c(
-    "You can cancel or change a slot up to 6 hours before it starts.",
-    "You can do this 3 times in any 30 days. Changes and cancellations count together.",
-    "A cancelled slot is released and goes to the priority queue.")),
+    "You can cancel or change a slot up to 6 hours before it starts. Up to 2 cancellations are allowed in any 30 days.",
+    "A cancelled slot becomes a free slot (see section 5).")),
   list(title = "4. Cancellation vs no-show", bullets = c(
-    "Cancellation: you tell the app at least 6 hours before your slot. It doesn't count against you and is not a no-show. It does use one of your 3 changes for the 30 days.",
-    "No-show: you don't check in within 15 minutes of your slot's start, or you cancel less than 6 hours before. It moves you further back in the queue (see section 5).",
-    "A resident can have at most 3 no-shows. After your 3rd no-show, your allowance for the following month is reduced by 2 slots.")),
-  list(title = "5. Priority Queue for free slots",
-       intro = "A slot can become free at short notice, a few hours before it starts or right at the start, for example because someone cancelled or didn't check in. It goes to the first person in the queue by this order. If two people are in the same group, whoever asked first goes first.",
-       numbered = c(
-    "You cancelled your slot and haven't had your 1st slot in this 10-day cycle.",
-    "You haven't had your 2nd slot in this cycle.",
-    "You had 1 no-show and haven't had your 1st slot.",
-    "You had 1 no-show and haven't had your 2nd slot.",
-    "You asked for an extra slot after using both of your slots.",
-    "You had 2 no-shows and haven't had your 1st slot.",
-    "You had 2 no-shows and haven't had your 2nd slot.",
-    "You had 3 no-shows and haven't had your 1st slot.",
-    "You had 3 no-shows and haven't had your 2nd slot.")),
+    "Not turning up, or cancelling less than 6 hours before the slot, counts as a no-show. Up to 2 no-shows are allowed in any 30 days.",
+    "On your 3rd no-show you will get 1 slot fewer in the next month. On your 3rd cancellation you will also get 1 slot fewer in the next month.")),
+  list(title = "5. Free slots", bullets = c(
+    "When a slot is cancelled or missed, it becomes a free slot and appears in the app. Any resident can book a free slot that is visible in the app, first come first served. There is no waiting list and no automatic rescheduling.")),
   list(title = "6. Walk-in (emergency) slots",
        intro = "Some slots, usually at times when most residents are in class such as mornings, are kept free and not booked in advance. Use them for urgent washes. They are open to anyone in your block's allowed group."),
   list(title = "7. Your data", bullets = c(
